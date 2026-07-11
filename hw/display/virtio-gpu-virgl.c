@@ -21,6 +21,7 @@
 #include "hw/virtio/virtio-gpu-pixman.h"
 
 #include "ui/egl-helpers.h"
+#include "standard-headers/drm/drm_fourcc.h"
 
 #include <virglrenderer.h>
 
@@ -48,6 +49,7 @@ struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
     MemoryRegion *mr;
     void *map_fixed;
+    uint64_t dmabuf_modifier;
 };
 
 static struct virtio_gpu_virgl_resource *
@@ -841,6 +843,7 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
     res->base.resource_id = cblob.resource_id;
     res->base.blob_size = cblob.size;
     res->base.dmabuf_fd = -1;
+    res->dmabuf_modifier = DRM_FORMAT_MOD_INVALID;
 
     if (cblob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D) {
         ret = virtio_gpu_create_mapping_iov(g, cblob.nr_entries, sizeof(cblob),
@@ -870,7 +873,21 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
         return;
     }
 
+#ifdef VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION
+    {
+        struct virgl_renderer_resource_info_ext ext = {
+            .version = VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION,
+        };
+
+        ret = virgl_renderer_resource_get_info_ext(cblob.resource_id, &ext);
+        info = ext.base;
+        if (!ret && ext.has_dmabuf_export) {
+            res->dmabuf_modifier = ext.modifiers;
+        }
+    }
+#else
     ret = virgl_renderer_resource_get_info(cblob.resource_id, &info);
+#endif
     if (ret) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: resource does not have info %d: %s\n",
@@ -1007,13 +1024,20 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
         return;
     }
 
-    if (!virtio_gpu_scanout_blob_to_fb(&fb, &ss, res->base.blob_size)) {
+    /*
+     * virglrenderer exported this HOST3D resource as a DMA-BUF.  Its native
+     * Vulkan layout may be OPTIMAL, so a linear stride * height end check is not
+     * meaningful; the selected display backend validates the host-owned layout.
+     */
+    if (!virtio_gpu_scanout_blob_to_fb_native(&fb, &ss,
+                                               res->base.blob_size)) {
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
         return;
     }
 
     g->parent_obj.enable = 1;
-    if (virtio_gpu_update_dmabuf(g, ss.scanout_id, &res->base, &fb, &ss.r)) {
+    if (virtio_gpu_update_dmabuf(g, ss.scanout_id, &res->base, &fb, &ss.r,
+                                 res->dmabuf_modifier)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to update dmabuf\n",
                       __func__);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;

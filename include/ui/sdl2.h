@@ -24,6 +24,9 @@
 #include "ui/kbd-state.h"
 #ifdef CONFIG_OPENGL
 # include "ui/egl-helpers.h"
+# ifdef CONFIG_LINUX
+#  include "ui/vulkan-readback.h"
+# endif
 #endif
 
 struct sdl2_console {
@@ -52,6 +55,10 @@ struct sdl2_console {
     egl_fb win_fb;
     bool y0_top;
     bool scanout_mode;
+#ifdef CONFIG_LINUX
+    HeliosVulkanReadbackCache *vk_readback_cache;
+    QemuDmaBuf *vk_readback_dmabuf;
+#endif
 #endif
 };
 

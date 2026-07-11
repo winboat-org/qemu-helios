@@ -369,6 +369,10 @@ void virtio_gpu_update_cursor_data(VirtIOGPU *g,
 bool virtio_gpu_scanout_blob_to_fb(struct virtio_gpu_framebuffer *fb,
                                    struct virtio_gpu_set_scanout_blob *ss,
                                    uint64_t blob_size);
+bool virtio_gpu_scanout_blob_to_fb_native(
+    struct virtio_gpu_framebuffer *fb,
+    struct virtio_gpu_set_scanout_blob *ss,
+    uint64_t blob_size);
 
 /* virtio-gpu-udmabuf.c */
 bool virtio_gpu_have_udmabuf(void);
@@ -379,7 +383,8 @@ int virtio_gpu_update_dmabuf(VirtIOGPU *g,
                              uint32_t scanout_id,
                              struct virtio_gpu_simple_resource *res,
                              struct virtio_gpu_framebuffer *fb,
-                             struct virtio_gpu_rect *r);
+                             struct virtio_gpu_rect *r,
+                             uint64_t modifier);
 
 void virtio_gpu_update_scanout(VirtIOGPU *g,
                                uint32_t scanout_id,

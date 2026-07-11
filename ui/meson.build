@@ -60,13 +60,20 @@ if opengl.found()
   opengl_ss.add(gbm, pixman)
   opengl_ss.add(when: [opengl],
                if_true: files('shader.c', 'console-gl.c', 'egl-helpers.c', 'egl-context.c'))
+  if host_os == 'linux'
+    vulkan = cc.find_library('vulkan', required: true)
+    vulkan_headers = declare_dependency(
+      include_directories: include_directories('../third_party/Vulkan-Headers/include'))
+    opengl_ss.add(vulkan, vulkan_headers, files('vulkan-readback.c'))
+  endif
   ui_modules += {'opengl' : opengl_ss}
 endif
 
 if opengl.found()
   egl_headless_ss = ss.source_set()
+  egl_headless_sources = files('egl-headless.c')
   egl_headless_ss.add(when: [opengl, pixman],
-                      if_true: [files('egl-headless.c'), gbm])
+                      if_true: [egl_headless_sources, gbm])
   ui_modules += {'egl-headless' : egl_headless_ss}
 endif
 

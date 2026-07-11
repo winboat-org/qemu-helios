@@ -19,6 +19,7 @@ struct QemuDmaBuf {
     uint32_t  num_planes;
     uint32_t  fourcc;
     uint64_t  modifier;
+    uint64_t  allocation_size;
     uint32_t  texture;
     uint32_t  x;
     uint32_t  y;
@@ -166,6 +167,12 @@ uint64_t qemu_dmabuf_get_modifier(QemuDmaBuf *dmabuf)
     return dmabuf->modifier;
 }
 
+uint64_t qemu_dmabuf_get_allocation_size(QemuDmaBuf *dmabuf)
+{
+    assert(dmabuf != NULL);
+    return dmabuf->allocation_size;
+}
+
 uint32_t qemu_dmabuf_get_texture(QemuDmaBuf *dmabuf)
 {
     assert(dmabuf != NULL);
@@ -240,6 +247,12 @@ void qemu_dmabuf_set_texture(QemuDmaBuf *dmabuf, uint32_t texture)
 {
     assert(dmabuf != NULL);
     dmabuf->texture = texture;
+}
+
+void qemu_dmabuf_set_allocation_size(QemuDmaBuf *dmabuf, uint64_t size)
+{
+    assert(dmabuf != NULL);
+    dmabuf->allocation_size = size;
 }
 
 void qemu_dmabuf_set_fence_fd(QemuDmaBuf *dmabuf, int32_t fence_fd)

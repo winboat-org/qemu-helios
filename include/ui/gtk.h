@@ -24,6 +24,9 @@
 #if defined(CONFIG_OPENGL)
 #include "ui/egl-helpers.h"
 #include "ui/egl-context.h"
+#if defined(CONFIG_LINUX)
+#include "ui/vulkan-readback.h"
+#endif
 #endif
 #ifdef CONFIG_VTE
 #include "qemu/fifo8.h"
@@ -58,6 +61,10 @@ typedef struct VirtualGfxConsole {
     bool y0_top;
     bool scanout_mode;
     bool has_dmabuf;
+#if defined(CONFIG_LINUX)
+    HeliosVulkanReadbackCache *vk_readback_cache;
+    QemuDmaBuf *vk_readback_dmabuf;
+#endif
 #endif
 } VirtualGfxConsole;
 
@@ -92,6 +99,14 @@ typedef struct VirtualConsole {
 #endif
     };
 } VirtualConsole;
+
+#if defined(CONFIG_OPENGL) && defined(CONFIG_LINUX)
+HeliosVulkanReadback *gd_vulkan_scanout_activate(VirtualConsole *vc,
+                                                 QemuDmaBuf *dmabuf);
+HeliosVulkanReadback *gd_vulkan_scanout_active(VirtualConsole *vc);
+void gd_vulkan_scanout_release(VirtualConsole *vc, QemuDmaBuf *dmabuf);
+void gd_vulkan_scanout_clear(VirtualConsole *vc);
+#endif
 
 struct GtkDisplayState {
     GtkWidget *window;

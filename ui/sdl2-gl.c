@@ -31,6 +31,47 @@
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/sdl2.h"
+#ifdef CONFIG_LINUX
+#include "standard-headers/drm/drm_fourcc.h"
+#endif
+
+#ifdef CONFIG_LINUX
+static HeliosVulkanReadback *
+sdl2_vulkan_scanout_activate(struct sdl2_console *scon, QemuDmaBuf *dmabuf)
+{
+    HeliosVulkanReadback *readback;
+
+    if (qemu_dmabuf_get_modifier(dmabuf) != DRM_FORMAT_MOD_INVALID) {
+        return NULL;
+    }
+    if (!scon->vk_readback_cache) {
+        scon->vk_readback_cache = helios_vulkan_readback_cache_new();
+    }
+    readback = helios_vulkan_readback_cache_activate(
+        scon->vk_readback_cache, dmabuf, true);
+    if (readback) {
+        scon->vk_readback_dmabuf = dmabuf;
+    }
+    return readback;
+}
+
+static void sdl2_vulkan_scanout_release(struct sdl2_console *scon,
+                                        QemuDmaBuf *dmabuf)
+{
+    helios_vulkan_readback_cache_deactivate(scon->vk_readback_cache,
+                                            dmabuf);
+    if (!dmabuf || scon->vk_readback_dmabuf == dmabuf) {
+        scon->vk_readback_dmabuf = NULL;
+    }
+}
+
+static void sdl2_vulkan_scanout_clear(struct sdl2_console *scon)
+{
+    g_clear_pointer(&scon->vk_readback_cache,
+                    helios_vulkan_readback_cache_free);
+    scon->vk_readback_dmabuf = NULL;
+}
+#endif
 
 static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
 {
@@ -200,6 +241,9 @@ void sdl2_gl_scanout_disable(DisplayChangeListener *dcl)
     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
 
     assert(scon->opengl);
+#ifdef CONFIG_LINUX
+    sdl2_vulkan_scanout_clear(scon);
+#endif
     scon->w = 0;
     scon->h = 0;
     sdl2_set_scanout_mode(scon, false);
@@ -217,6 +261,9 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
 
     assert(scon->opengl);
+#ifdef CONFIG_LINUX
+    sdl2_vulkan_scanout_release(scon, NULL);
+#endif
     scon->x = x;
     scon->y = y;
     scon->w = w;
@@ -237,6 +284,25 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
     int ww, wh;
 
     assert(scon->opengl);
+#ifdef CONFIG_LINUX
+    HeliosVulkanReadback *readback =
+        helios_vulkan_readback_cache_active(scon->vk_readback_cache);
+    if (readback && (!w || !h)) {
+        x = 0;
+        y = 0;
+        w = scon->w;
+        h = scon->h;
+    }
+    if (readback && scon->surface && scon->gls &&
+        helios_vulkan_readback_flush(readback, scon->surface,
+                                     x, y, w, h)) {
+        SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+        surface_gl_update_texture(scon->gls, scon->surface, x, y, w, h);
+        sdl2_set_scanout_mode(scon, false);
+        sdl2_gl_render_surface(scon);
+        return;
+    }
+#endif
     if (!scon->scanout_mode) {
         return;
     }
@@ -263,6 +329,17 @@ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
     assert(scon->opengl);
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
 
+#ifdef CONFIG_LINUX
+    if (sdl2_vulkan_scanout_activate(scon, dmabuf)) {
+        scon->x = qemu_dmabuf_get_x(dmabuf);
+        scon->y = qemu_dmabuf_get_y(dmabuf);
+        scon->w = qemu_dmabuf_get_width(dmabuf);
+        scon->h = qemu_dmabuf_get_height(dmabuf);
+        sdl2_set_scanout_mode(scon, false);
+        return;
+    }
+#endif
+
     egl_dmabuf_import_texture(dmabuf);
     if (!qemu_dmabuf_get_texture(dmabuf)) {
         fds = qemu_dmabuf_get_fds(dmabuf, NULL);
@@ -286,6 +363,11 @@ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
 void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
                             QemuDmaBuf *dmabuf)
 {
+#ifdef CONFIG_LINUX
+    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+
+    sdl2_vulkan_scanout_release(scon, dmabuf);
+#endif
     egl_dmabuf_release_texture(dmabuf);
 }
 

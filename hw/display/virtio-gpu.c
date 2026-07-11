@@ -32,6 +32,8 @@
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/host-utils.h"
+#include "standard-headers/drm/drm_fourcc.h"
 
 #define VIRTIO_GPU_VM_VERSION 1
 
@@ -650,7 +652,8 @@ static bool virtio_gpu_do_set_scanout(VirtIOGPU *g,
 
     if (res->blob) {
         if (console_has_gl(scanout->con)) {
-            if (!virtio_gpu_update_dmabuf(g, scanout_id, res, fb, r)) {
+            if (!virtio_gpu_update_dmabuf(g, scanout_id, res, fb, r,
+                                          DRM_FORMAT_MOD_INVALID)) {
                 virtio_gpu_update_scanout(g, scanout_id, res, fb, r);
             } else {
                 *error = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
@@ -735,11 +738,13 @@ static void virtio_gpu_set_scanout(VirtIOGPU *g,
                               &fb, res, &ss.r, &cmd->error);
 }
 
-bool virtio_gpu_scanout_blob_to_fb(struct virtio_gpu_framebuffer *fb,
-                                   struct virtio_gpu_set_scanout_blob *ss,
-                                   uint64_t blob_size)
+static bool virtio_gpu_scanout_blob_to_fb_layout(
+    struct virtio_gpu_framebuffer *fb,
+    struct virtio_gpu_set_scanout_blob *ss,
+    uint64_t blob_size,
+    bool native_dmabuf_layout)
 {
-    uint64_t fbend;
+    uint64_t row_bytes, x_bytes, y_bytes, offset, fb_bytes, fbend;
 
     fb->format = virtio_gpu_get_pixman_format(ss->format);
     if (!fb->format) {
@@ -753,22 +758,54 @@ bool virtio_gpu_scanout_blob_to_fb(struct virtio_gpu_framebuffer *fb,
     fb->width = ss->width;
     fb->height = ss->height;
     fb->stride = ss->strides[0];
-    fb->offset = ss->offsets[0] + ss->r.x * fb->bytes_pp + ss->r.y * fb->stride;
-
-    fbend = fb->offset;
-    fbend += (uint64_t) fb->stride * ss->r.height;
-
-    if (fbend > blob_size) {
+    if (umul64_overflow(fb->width, fb->bytes_pp, &row_bytes) ||
+        fb->stride < row_bytes ||
+        umul64_overflow(ss->r.x, fb->bytes_pp, &x_bytes) ||
+        umul64_overflow(ss->r.y, fb->stride, &y_bytes) ||
+        uadd64_overflow(ss->offsets[0], x_bytes, &offset) ||
+        uadd64_overflow(offset, y_bytes, &offset) || offset > UINT32_MAX ||
+        umul64_overflow(fb->stride, ss->r.height, &fb_bytes) ||
+        uadd64_overflow(offset, fb_bytes, &fbend)) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: fb end out of range\n",
+                      "%s: invalid or overflowing framebuffer layout\n",
                       __func__);
+        return false;
+    }
+    fb->offset = (uint32_t)offset;
+
+    /*
+     * blob_size is a linear byte-span contract for ordinary blob scanout.
+     * A renderer-exported native DMA-BUF may instead be a Vulkan OPTIMAL image:
+     * its allocation size is not stride * height, and the host graphics driver
+     * owns the opaque layout metadata.  Still require the first addressed byte
+     * to be inside the allocation and reject all arithmetic/stride errors above.
+     * The selected display backend must then validate/import the native layout.
+     */
+    if (fb->offset >= blob_size || (!native_dmabuf_layout && fbend > blob_size)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: framebuffer range [0x%" PRIx64 ",0x%" PRIx64
+                      ") exceeds blob size 0x%" PRIx64 "\n",
+                      __func__, (uint64_t)fb->offset, fbend, blob_size);
         return false;
     }
 
     return true;
 }
 
+bool virtio_gpu_scanout_blob_to_fb(struct virtio_gpu_framebuffer *fb,
+                                   struct virtio_gpu_set_scanout_blob *ss,
+                                   uint64_t blob_size)
+{
+    return virtio_gpu_scanout_blob_to_fb_layout(fb, ss, blob_size, false);
+}
 
+bool virtio_gpu_scanout_blob_to_fb_native(
+    struct virtio_gpu_framebuffer *fb,
+    struct virtio_gpu_set_scanout_blob *ss,
+    uint64_t blob_size)
+{
+    return virtio_gpu_scanout_blob_to_fb_layout(fb, ss, blob_size, true);
+}
 
 static void virtio_gpu_set_scanout_blob(VirtIOGPU *g,
                                         struct virtio_gpu_ctrl_command *cmd)
