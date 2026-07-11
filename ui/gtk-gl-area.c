@@ -295,6 +295,9 @@ void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
 {
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
 
+#if defined(CONFIG_LINUX)
+    gd_vulkan_scanout_release(vc, NULL);
+#endif
     vc->gfx.x = x;
     vc->gfx.y = y;
     vc->gfx.w = w;
@@ -317,6 +320,9 @@ void gd_gl_area_scanout_disable(DisplayChangeListener *dcl)
 {
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
 
+#if defined(CONFIG_LINUX)
+    gd_vulkan_scanout_clear(vc);
+#endif
     gtk_gl_area_set_scanout_mode(vc, false);
 }
 
@@ -324,6 +330,18 @@ void gd_gl_area_scanout_flush(DisplayChangeListener *dcl,
                           uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
+
+#if defined(CONFIG_LINUX)
+    HeliosVulkanReadback *readback = gd_vulkan_scanout_active(vc);
+    if (readback && vc->gfx.ds && vc->gfx.gls &&
+        helios_vulkan_readback_flush(readback, vc->gfx.ds, x, y, w, h)) {
+        gtk_gl_area_make_current(GTK_GL_AREA(vc->gfx.drawing_area));
+        surface_gl_update_texture(vc->gfx.gls, vc->gfx.ds, x, y, w, h);
+        gtk_gl_area_set_scanout_mode(vc, false);
+        gtk_gl_area_queue_render(GTK_GL_AREA(vc->gfx.drawing_area));
+        return;
+    }
+#endif
 
     if (vc->gfx.guest_fb.dmabuf &&
         !qemu_dmabuf_get_draw_submitted(vc->gfx.guest_fb.dmabuf)) {
@@ -342,6 +360,16 @@ void gd_gl_area_scanout_dmabuf(DisplayChangeListener *dcl,
     bool y0_top;
 
     gtk_gl_area_make_current(GTK_GL_AREA(vc->gfx.drawing_area));
+#if defined(CONFIG_LINUX)
+    if (gd_vulkan_scanout_activate(vc, dmabuf)) {
+        vc->gfx.x = qemu_dmabuf_get_x(dmabuf);
+        vc->gfx.y = qemu_dmabuf_get_y(dmabuf);
+        vc->gfx.w = qemu_dmabuf_get_width(dmabuf);
+        vc->gfx.h = qemu_dmabuf_get_height(dmabuf);
+        gtk_gl_area_set_scanout_mode(vc, false);
+        return;
+    }
+#endif
     egl_dmabuf_import_texture(dmabuf);
     texture = qemu_dmabuf_get_texture(dmabuf);
     if (!texture) {

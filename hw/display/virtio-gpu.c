@@ -32,6 +32,8 @@
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/host-utils.h"
+#include "standard-headers/drm/drm_fourcc.h"
 
 #define VIRTIO_GPU_VM_VERSION 1
 
@@ -691,7 +693,8 @@ static bool virtio_gpu_do_set_scanout(VirtIOGPU *g,
 
     if (res->blob) {
         if (qemu_console_has_gl(scanout->con)) {
-            if (!virtio_gpu_update_dmabuf(g, scanout_id, res, fb, r)) {
+            if (!virtio_gpu_update_dmabuf(g, scanout_id, res, fb, r,
+                                          DRM_FORMAT_MOD_INVALID)) {
                 virtio_gpu_update_scanout(g, scanout_id, res, fb, r);
             } else {
                 *error = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
@@ -781,11 +784,13 @@ static void virtio_gpu_set_scanout(VirtIOGPU *g,
                               &fb, res, &ss.r, &cmd->error);
 }
 
-bool virtio_gpu_scanout_blob_to_fb(struct virtio_gpu_framebuffer *fb,
-                                   struct virtio_gpu_set_scanout_blob *ss,
-                                   uint64_t blob_size)
+static bool virtio_gpu_scanout_blob_to_fb_layout(
+    struct virtio_gpu_framebuffer *fb,
+    struct virtio_gpu_set_scanout_blob *ss,
+    uint64_t blob_size,
+    bool native_dmabuf_layout)
 {
-    uint64_t fbend, offset;
+    uint64_t row_bytes, x_bytes, y_bytes, offset, fb_bytes, fbend;
     uint32_t bytes_pp;
 
     fb->format = virtio_gpu_get_pixman_format(ss->format);
@@ -800,39 +805,54 @@ bool virtio_gpu_scanout_blob_to_fb(struct virtio_gpu_framebuffer *fb,
     fb->width = ss->width;
     fb->height = ss->height;
     fb->stride = ss->strides[0];
-
-    if (fb->stride < (uint64_t)fb->width * bytes_pp) {
+    if (umul64_overflow(fb->width, bytes_pp, &row_bytes) ||
+        fb->stride < row_bytes ||
+        umul64_overflow(ss->r.x, bytes_pp, &x_bytes) ||
+        umul64_overflow(ss->r.y, fb->stride, &y_bytes) ||
+        uadd64_overflow(ss->offsets[0], x_bytes, &offset) ||
+        uadd64_overflow(offset, y_bytes, &offset) || offset > UINT32_MAX ||
+        umul64_overflow(fb->stride, ss->r.height, &fb_bytes) ||
+        uadd64_overflow(offset, fb_bytes, &fbend)) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: stride %u too small for width %u at %u bpp\n",
-                      __func__, fb->stride, fb->width, bytes_pp);
-        return false;
-    }
-
-    if (fb->stride > INT_MAX) {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: stride is %" PRIu32
-                      ", larger than the supported maximum (%d)\n",
-                      __func__, fb->stride, INT_MAX);
-        return false;
-    }
-
-    offset = (uint64_t)ss->offsets[0] + (uint64_t)ss->r.x * bytes_pp +
-             (uint64_t)ss->r.y * fb->stride;
-
-    fbend = offset + (uint64_t)fb->stride * ss->r.height;
-
-    if (offset > UINT32_MAX || fbend > blob_size) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: invalid fb bounds\n",
+                      "%s: invalid or overflowing framebuffer layout\n",
                       __func__);
         return false;
     }
+    fb->offset = (uint32_t)offset;
 
-    fb->offset = offset;
+    /*
+     * blob_size is a linear byte-span contract for ordinary blob scanout.
+     * A renderer-exported native DMA-BUF may instead be a Vulkan OPTIMAL image:
+     * its allocation size is not stride * height, and the host graphics driver
+     * owns the opaque layout metadata.  Still require the first addressed byte
+     * to be inside the allocation and reject all arithmetic/stride errors above.
+     * The selected display backend must then validate/import the native layout.
+     */
+    if (fb->offset >= blob_size || (!native_dmabuf_layout && fbend > blob_size)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: framebuffer range [0x%" PRIx64 ",0x%" PRIx64
+                      ") exceeds blob size 0x%" PRIx64 "\n",
+                      __func__, (uint64_t)fb->offset, fbend, blob_size);
+        return false;
+    }
 
     return true;
 }
 
+bool virtio_gpu_scanout_blob_to_fb(struct virtio_gpu_framebuffer *fb,
+                                   struct virtio_gpu_set_scanout_blob *ss,
+                                   uint64_t blob_size)
+{
+    return virtio_gpu_scanout_blob_to_fb_layout(fb, ss, blob_size, false);
+}
 
+bool virtio_gpu_scanout_blob_to_fb_native(
+    struct virtio_gpu_framebuffer *fb,
+    struct virtio_gpu_set_scanout_blob *ss,
+    uint64_t blob_size)
+{
+    return virtio_gpu_scanout_blob_to_fb_layout(fb, ss, blob_size, true);
+}
 
 static void virtio_gpu_set_scanout_blob(VirtIOGPU *g,
                                         struct virtio_gpu_ctrl_command *cmd)

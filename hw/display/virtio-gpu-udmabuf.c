@@ -188,7 +188,8 @@ static VGPUDMABuf
                           uint32_t scanout_id,
                           struct virtio_gpu_simple_resource *res,
                           struct virtio_gpu_framebuffer *fb,
-                          struct virtio_gpu_rect *r)
+                          struct virtio_gpu_rect *r,
+                          uint64_t modifier)
 {
     VGPUDMABuf *dmabuf;
     uint32_t offset = 0;
@@ -202,8 +203,9 @@ static VGPUDMABuf
                                   &offset, &fb->stride,
                                   r->x, r->y, fb->width, fb->height,
                                   qemu_pixman_to_drm_format(fb->format),
-                                  DRM_FORMAT_MOD_INVALID, &res->dmabuf_fd,
+                                  modifier, &res->dmabuf_fd,
                                   1, true, false);
+    qemu_dmabuf_set_allocation_size(dmabuf->buf, res->blob_size);
     dmabuf->scanout_id = scanout_id;
     QTAILQ_INSERT_HEAD(&g->dmabuf.bufs, dmabuf, next);
 
@@ -214,13 +216,15 @@ int virtio_gpu_update_dmabuf(VirtIOGPU *g,
                              uint32_t scanout_id,
                              struct virtio_gpu_simple_resource *res,
                              struct virtio_gpu_framebuffer *fb,
-                             struct virtio_gpu_rect *r)
+                             struct virtio_gpu_rect *r,
+                             uint64_t modifier)
 {
     struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_id];
     VGPUDMABuf *new_primary, *old_primary = NULL;
     uint32_t width, height;
 
-    new_primary = virtio_gpu_create_dmabuf(g, scanout_id, res, fb, r);
+    new_primary = virtio_gpu_create_dmabuf(g, scanout_id, res, fb, r,
+                                           modifier);
     if (!new_primary) {
         return -EINVAL;
     }

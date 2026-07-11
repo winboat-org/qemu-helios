@@ -227,6 +227,9 @@ void gd_egl_scanout_disable(DisplayChangeListener *dcl)
 {
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
 
+#if defined(CONFIG_LINUX)
+    gd_vulkan_scanout_clear(vc);
+#endif
     vc->gfx.w = 0;
     vc->gfx.h = 0;
     gtk_egl_set_scanout_mode(vc, false);
@@ -241,6 +244,9 @@ void gd_egl_scanout_texture(DisplayChangeListener *dcl,
 {
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
 
+#if defined(CONFIG_LINUX)
+    gd_vulkan_scanout_release(vc, NULL);
+#endif
     vc->gfx.x = x;
     vc->gfx.y = y;
     vc->gfx.w = w;
@@ -272,6 +278,17 @@ void gd_egl_scanout_dmabuf(DisplayChangeListener *dcl,
 
     eglMakeCurrent(qemu_egl_display, vc->gfx.esurface,
                    vc->gfx.esurface, vc->gfx.ectx);
+
+#if defined(CONFIG_LINUX)
+    if (gd_vulkan_scanout_activate(vc, dmabuf)) {
+        vc->gfx.x = qemu_dmabuf_get_x(dmabuf);
+        vc->gfx.y = qemu_dmabuf_get_y(dmabuf);
+        vc->gfx.w = qemu_dmabuf_get_width(dmabuf);
+        vc->gfx.h = qemu_dmabuf_get_height(dmabuf);
+        gtk_egl_set_scanout_mode(vc, false);
+        return;
+    }
+#endif
 
     egl_dmabuf_import_texture(dmabuf);
     texture = qemu_dmabuf_get_texture(dmabuf);
@@ -403,6 +420,18 @@ void gd_egl_flush(DisplayChangeListener *dcl,
 {
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
     GtkWidget *area = vc->gfx.drawing_area;
+
+#if defined(CONFIG_LINUX)
+    HeliosVulkanReadback *readback = gd_vulkan_scanout_active(vc);
+    if (readback && vc->gfx.ds && vc->gfx.gls &&
+        helios_vulkan_readback_flush(readback, vc->gfx.ds, x, y, w, h)) {
+        eglMakeCurrent(qemu_egl_display, vc->gfx.esurface,
+                       vc->gfx.esurface, vc->gfx.ectx);
+        surface_gl_update_texture(vc->gfx.gls, vc->gfx.ds, x, y, w, h);
+        gd_egl_draw(vc);
+        return;
+    }
+#endif
 
     if (vc->gfx.guest_fb.dmabuf &&
         !qemu_dmabuf_get_draw_submitted(vc->gfx.guest_fb.dmabuf)) {

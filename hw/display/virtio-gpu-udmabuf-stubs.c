@@ -21,7 +21,8 @@ int virtio_gpu_update_dmabuf(VirtIOGPU *g,
                              uint32_t scanout_id,
                              struct virtio_gpu_simple_resource *res,
                              struct virtio_gpu_framebuffer *fb,
-                             struct virtio_gpu_rect *r)
+                             struct virtio_gpu_rect *r,
+                             uint64_t modifier)
 {
     /* nothing (stub) */
     return 0;

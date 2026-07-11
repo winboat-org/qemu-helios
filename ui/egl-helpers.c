@@ -410,13 +410,25 @@ void egl_dmabuf_import_texture(QemuDmaBuf *dmabuf)
     }
 
     glGenTextures(1, &texture);
-    qemu_dmabuf_set_texture(dmabuf, texture);
     glBindTexture(GL_TEXTURE_2D, texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
+    while (glGetError() != GL_NO_ERROR) {
+        /* Attribute the next error to the EGLImage texture bind itself. */
+    }
     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+    GLenum bind_error = glGetError();
     eglDestroyImageKHR(qemu_egl_display, image);
+
+    if (bind_error != GL_NO_ERROR) {
+        error_report("glEGLImageTargetTexture2DOES failed: 0x%x",
+                     bind_error);
+        glDeleteTextures(1, &texture);
+        return;
+    }
+
+    qemu_dmabuf_set_texture(dmabuf, texture);
 }
 
 void egl_dmabuf_release_texture(QemuDmaBuf *dmabuf)

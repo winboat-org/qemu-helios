@@ -42,6 +42,9 @@
 
 #include "ui/console.h"
 #include "ui/gtk.h"
+#if defined(CONFIG_LINUX)
+#include "standard-headers/drm/drm_fourcc.h"
+#endif
 #ifdef G_OS_WIN32
 #include <gdk/gdkwin32.h>
 #endif
@@ -571,6 +574,48 @@ static const DisplayChangeListenerOps dcl_ops = {
 
 #if defined(CONFIG_OPENGL)
 
+#if defined(CONFIG_LINUX)
+HeliosVulkanReadback *gd_vulkan_scanout_activate(VirtualConsole *vc,
+                                                 QemuDmaBuf *dmabuf)
+{
+    HeliosVulkanReadback *readback;
+
+    if (qemu_dmabuf_get_modifier(dmabuf) != DRM_FORMAT_MOD_INVALID) {
+        return NULL;
+    }
+    if (!vc->gfx.vk_readback_cache) {
+        vc->gfx.vk_readback_cache = helios_vulkan_readback_cache_new();
+    }
+    readback = helios_vulkan_readback_cache_activate(
+        vc->gfx.vk_readback_cache, dmabuf, true);
+    if (readback) {
+        vc->gfx.vk_readback_dmabuf = dmabuf;
+    }
+    return readback;
+}
+
+HeliosVulkanReadback *gd_vulkan_scanout_active(VirtualConsole *vc)
+{
+    return helios_vulkan_readback_cache_active(vc->gfx.vk_readback_cache);
+}
+
+void gd_vulkan_scanout_release(VirtualConsole *vc, QemuDmaBuf *dmabuf)
+{
+    helios_vulkan_readback_cache_deactivate(vc->gfx.vk_readback_cache,
+                                            dmabuf);
+    if (!dmabuf || vc->gfx.vk_readback_dmabuf == dmabuf) {
+        vc->gfx.vk_readback_dmabuf = NULL;
+    }
+}
+
+void gd_vulkan_scanout_clear(VirtualConsole *vc)
+{
+    g_clear_pointer(&vc->gfx.vk_readback_cache,
+                    helios_vulkan_readback_cache_free);
+    vc->gfx.vk_readback_dmabuf = NULL;
+}
+#endif
+
 static bool gd_has_dmabuf(DisplayChangeListener *dcl)
 {
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
@@ -590,6 +635,9 @@ static void gd_gl_release_dmabuf(DisplayChangeListener *dcl,
 #ifdef CONFIG_GBM
     VirtualConsole *vc = container_of(dcl, VirtualConsole, gfx.dcl);
 
+#if defined(CONFIG_LINUX)
+    gd_vulkan_scanout_release(vc, dmabuf);
+#endif
     egl_dmabuf_release_texture(dmabuf);
     if (vc->gfx.guest_fb.dmabuf == dmabuf) {
         vc->gfx.guest_fb.dmabuf = NULL;
