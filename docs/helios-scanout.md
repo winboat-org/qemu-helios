@@ -46,6 +46,13 @@ QEMU display surface. True zero-copy requires an importable layout contract,
 such as a correct explicit DRM modifier, without changing ordinary guest image
 imports.
 
+Interactive frontends need two different GPU selections on a hybrid Wayland
+host. SDL/GTK must create their EGL context through the compositor's normal EGL
+vendor (Mesa/Intel on the Helios development host), while the Vulkan fallback
+and Venus renderer remain pinned to NVIDIA with `VK_ICD_FILENAMES` and
+`__VK_LAYER_NV_optimus`. Globally forcing NVIDIA EGL prevents a Wayland context
+from being created. The Helios launcher applies this split automatically.
+
 ## Verification
 
 Build the affected modules together and then ask the QEMU binary to load all
@@ -59,5 +66,8 @@ QEMU_MODULE_DIR="$PWD/build-helios" \
   ./build-helios/qemu-system-x86_64 -display help
 ```
 
-egl-headless + VNC has visible-output verification on NVIDIA. GTK and SDL are
-compile/link verified; they still need a local visual smoke test.
+egl-headless + VNC and SDL OpenGL on native Wayland have visible-output
+verification on NVIDIA. SDL now fails loudly if it cannot create or make
+current an EGL-backed GL context. GTK/Wayland builds and initializes, but the
+full Windows run currently fails later with repeated GDK `eglMakeCurrent`
+errors; it is not a verified frontend yet.
