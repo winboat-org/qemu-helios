@@ -32,6 +32,7 @@ struct HeliosVulkanReadback {
     VkImageLayout producer_layout;
     bool external_ownership;
     bool direct_optimal;
+    bool swap_red_blue;
     uint64_t flushes;
 };
 
@@ -215,8 +216,10 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
     fourcc = qemu_dmabuf_get_fourcc(dmabuf);
     modifier = qemu_dmabuf_get_modifier(dmabuf);
     if (num_planes != 1 ||
-        (fourcc != DRM_FORMAT_XRGB8888 && fourcc != DRM_FORMAT_ARGB8888) ||
-        (modifier != DRM_FORMAT_MOD_INVALID &&
+        (fourcc != DRM_FORMAT_XRGB8888 && fourcc != DRM_FORMAT_ARGB8888 &&
+         fourcc != DRM_FORMAT_XBGR8888 && fourcc != DRM_FORMAT_ABGR8888) ||
+        (!direct_optimal &&
+         modifier != DRM_FORMAT_MOD_INVALID &&
          modifier != DRM_FORMAT_MOD_LINEAR)) {
         return NULL;
     }
@@ -228,7 +231,7 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
 
     if (direct_optimal) {
         dmabuf_size = qemu_dmabuf_get_allocation_size(dmabuf);
-        if (modifier != DRM_FORMAT_MOD_INVALID || !dmabuf_size) {
+        if (!dmabuf_size) {
             return NULL;
         }
     }
@@ -250,6 +253,8 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
         readback->dmabuf_size = qemu_dmabuf_get_allocation_size(dmabuf);
     }
     readback->direct_optimal = direct_optimal;
+    readback->swap_red_blue =
+        fourcc == DRM_FORMAT_XBGR8888 || fourcc == DRM_FORMAT_ABGR8888;
     readback->producer_layout = direct_optimal
         ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
         : VK_IMAGE_LAYOUT_GENERAL;
@@ -358,7 +363,9 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = &external_image,
         .imageType = VK_IMAGE_TYPE_2D,
-        .format = VK_FORMAT_B8G8R8A8_UNORM,
+        .format = readback->swap_red_blue
+            ? VK_FORMAT_R8G8B8A8_UNORM
+            : VK_FORMAT_B8G8R8A8_UNORM,
         .extent = {
             readback->backing_width,
             readback->backing_height,
@@ -452,10 +459,11 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
         VK_NEW(vkBindImageMemory(readback->device, readback->image,
                                  readback->image_memory, 0));
         error_report("vulkan-readback: DMA-BUF import tiling=%s "
-                     "usage=0x%x flags=0x%x size=%" PRIu64,
+                     "usage=0x%x flags=0x%x size=%" PRIu64
+                     " modifier=0x%" PRIx64,
                      direct_optimal ? "OPTIMAL" : "LINEAR",
                      image_info.usage, image_info.flags,
-                     (uint64_t)image_requirements.size);
+                     (uint64_t)image_requirements.size, modifier);
         break;
     }
     if (!readback->image || !readback->image_memory) {
@@ -517,9 +525,10 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
     VK_NEW(vkCreateFence(readback->device, &fence_info, NULL,
                          &readback->fence));
 
-    error_report("vulkan-readback: %s DMA-BUF ready %ux%u",
+    error_report("vulkan-readback: %s DMA-BUF ready %ux%u "
+                 "modifier=0x%" PRIx64,
                  direct_optimal ? "OPTIMAL" : "LINEAR",
-                 readback->backing_width, readback->backing_height);
+                 readback->backing_width, readback->backing_height, modifier);
     return readback;
 
 fail:
@@ -663,7 +672,16 @@ bool helios_vulkan_readback_flush(HeliosVulkanReadback *readback,
     dst = surface_data(surface) + (size_t)y * surface_stride(surface) +
           (size_t)x * 4;
     for (row = 0; row < height; row++) {
-        memcpy(dst, src, (size_t)width * 4);
+        if (readback->swap_red_blue) {
+            for (uint32_t col = 0; col < width; col++) {
+                dst[col * 4 + 0] = src[col * 4 + 2];
+                dst[col * 4 + 1] = src[col * 4 + 1];
+                dst[col * 4 + 2] = src[col * 4 + 0];
+                dst[col * 4 + 3] = src[col * 4 + 3];
+            }
+        } else {
+            memcpy(dst, src, (size_t)width * 4);
+        }
         src += (size_t)readback->backing_width * 4;
         dst += surface_stride(surface);
     }
