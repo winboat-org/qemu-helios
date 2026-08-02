@@ -22,6 +22,14 @@ void helios_vulkan_readback_cache_deactivate(
 HeliosVulkanReadback *helios_vulkan_readback_cache_active(
     HeliosVulkanReadbackCache *cache);
 void helios_vulkan_readback_free(HeliosVulkanReadback *readback);
+/*
+ * Identity of the DMA-BUF this readback IMPORTED, captured at import time --
+ * i.e. the memory the next flush will physically read, independent of whatever
+ * the caller believes is currently bound.
+ */
+void helios_vulkan_readback_identity(HeliosVulkanReadback *readback,
+                                     uint64_t *ino, uint64_t *size,
+                                     uint64_t *flushes);
 bool helios_vulkan_readback_flush(HeliosVulkanReadback *readback,
                                   DisplaySurface *surface,
                                   uint32_t x, uint32_t y,

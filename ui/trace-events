@@ -210,3 +210,7 @@ dbus_can_share_map(bool share) "can_share_map: %d"
 
 # egl-helpers.c
 egl_init_d3d11_device(void *p) "d3d device: %p"
+
+# egl-headless.c -- Helios scan-out oracle (defect 0ab-B)
+helios_scanout_bind(uint32_t res, uint64_t bound_ino, uint64_t size, uint32_t bw, uint32_t bh, uint32_t stride, uint32_t offset, uint64_t read_ino, uint64_t reuse, const char *path) "res %u bound_ino %"PRIu64" size %"PRIu64" backing %ux%u stride %u offset %u read_ino %"PRIu64" reuse %"PRIu64" path %s"
+helios_scanout_read(uint32_t res, uint64_t bound_ino, uint64_t read_ino, uint32_t xy, uint32_t wh, uint32_t sampled, uint32_t nonzero, uint32_t max, uint64_t csum, uint64_t seq) "res %u bound_ino %"PRIu64" read_ino %"PRIu64" xy 0x%08x wh 0x%08x sampled %u nonzero %u max %u csum 0x%016"PRIx64" seq %"PRIu64

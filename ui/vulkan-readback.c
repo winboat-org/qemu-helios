@@ -112,6 +112,21 @@ HeliosVulkanReadback *helios_vulkan_readback_cache_active(
     return cache ? cache->active : NULL;
 }
 
+void helios_vulkan_readback_identity(HeliosVulkanReadback *readback,
+                                     uint64_t *ino, uint64_t *size,
+                                     uint64_t *flushes)
+{
+    if (ino) {
+        *ino = readback ? (uint64_t)readback->dmabuf_ino : 0;
+    }
+    if (size) {
+        *size = readback ? readback->dmabuf_size : 0;
+    }
+    if (flushes) {
+        *flushes = readback ? readback->flushes : 0;
+    }
+}
+
 bool helios_vulkan_readback_matches(HeliosVulkanReadback *readback,
                                     QemuDmaBuf *dmabuf,
                                     bool direct_optimal)

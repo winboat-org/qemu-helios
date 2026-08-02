@@ -25,6 +25,7 @@ struct QemuDmaBuf {
     uint32_t  y;
     uint32_t  backing_width;
     uint32_t  backing_height;
+    uint32_t  source_id;
     bool      y0_top;
     void      *sync;
     int       fence_fd;
@@ -171,6 +172,25 @@ uint64_t qemu_dmabuf_get_allocation_size(QemuDmaBuf *dmabuf)
 {
     assert(dmabuf != NULL);
     return dmabuf->allocation_size;
+}
+
+/*
+ * Producer-assigned identity of the buffer (the virtio-gpu resource id for a
+ * scanout blob).  Purely diagnostic: it lets a display backend name, in its own
+ * log, exactly which guest resource it just read.
+ */
+uint32_t qemu_dmabuf_get_source_id(QemuDmaBuf *dmabuf)
+{
+    assert(dmabuf != NULL);
+
+    return dmabuf->source_id;
+}
+
+void qemu_dmabuf_set_source_id(QemuDmaBuf *dmabuf, uint32_t source_id)
+{
+    assert(dmabuf != NULL);
+
+    dmabuf->source_id = source_id;
 }
 
 uint32_t qemu_dmabuf_get_texture(QemuDmaBuf *dmabuf)

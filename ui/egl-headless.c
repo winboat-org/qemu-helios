@@ -2,12 +2,14 @@
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/bswap.h"
 #include "qapi/error.h"
 #include "ui/console.h"
 #include "ui/egl-helpers.h"
 #include "ui/egl-context.h"
 #include "ui/shader.h"
 #include "standard-headers/drm/drm_fourcc.h"
+#include "trace.h"
 
 #ifdef CONFIG_LINUX
 #include "ui/vulkan-readback.h"
@@ -37,6 +39,7 @@ typedef struct egl_dpy {
     uint32_t cpu_stride;
     uint64_t cpu_flushes;
     int cpu_sync_state;
+    uint64_t read_seq;
 #endif
 } egl_dpy;
 
@@ -64,6 +67,92 @@ static void egl_gfx_switch(DisplayChangeListener *dcl,
 
 #if defined(CONFIG_GBM) && defined(CONFIG_LINUX)
 
+/*
+ * Helios scan-out oracle (defect 0ab-B).
+ *
+ * Per FLUSH -- not per sample -- record what the host actually put on screen and
+ * which guest buffer it came out of.  The VNC-side sampler tops out at ~30/s
+ * while a fullscreen workload flushes at ~142/s, so it cannot resolve a single
+ * displayed frame; this can, because it runs inside the flush itself.
+ *
+ * Two identities are emitted deliberately:
+ *   bound_ino -- the DMA-BUF inode of the resource the guest currently has bound
+ *                (fstat'd at flush time: what SHOULD be read), and
+ *   read_ino  -- the DMA-BUF inode the active readback IMPORTED (what IS read).
+ * A divergence proves the host reads the wrong buffer; equality for two
+ * different resource ids proves the guest aliased them.
+ */
+typedef struct HeliosScanoutStats {
+    uint32_t sampled;
+    uint32_t nonzero;
+    uint32_t max;
+    uint64_t csum;
+} HeliosScanoutStats;
+
+/* Subsample the flushed rect: enough pixels to classify, cheap at 142 flushes/s. */
+#define HELIOS_ORACLE_STEP_X 4
+#define HELIOS_ORACLE_STEP_Y 4
+
+static void helios_scanout_stats(DisplaySurface *ds,
+                                 uint32_t x, uint32_t y,
+                                 uint32_t w, uint32_t h,
+                                 HeliosScanoutStats *out)
+{
+    const uint8_t *base;
+    size_t stride;
+    uint32_t row, col;
+
+    memset(out, 0, sizeof(*out));
+    if (!ds || !w || !h ||
+        x >= (uint32_t)surface_width(ds) || y >= (uint32_t)surface_height(ds)) {
+        return;
+    }
+    base = surface_data(ds);
+    stride = surface_stride(ds);
+    if (!base) {
+        return;
+    }
+    w = MIN(w, (uint32_t)surface_width(ds) - x);
+    h = MIN(h, (uint32_t)surface_height(ds) - y);
+
+    for (row = 0; row < h; row += HELIOS_ORACLE_STEP_Y) {
+        const uint8_t *line = base + (size_t)(y + row) * stride +
+                              (size_t)x * 4;
+
+        for (col = 0; col < w; col += HELIOS_ORACLE_STEP_X) {
+            uint32_t v = ldl_he_p(line + (size_t)col * 4) & 0x00ffffffu;
+            uint32_t r = (v >> 16) & 0xff, g = (v >> 8) & 0xff, b = v & 0xff;
+            uint32_t peak = MAX(r, MAX(g, b));
+
+            out->sampled++;
+            if (v) {
+                out->nonzero++;
+            }
+            if (peak > out->max) {
+                out->max = peak;
+            }
+            /* FNV-1a over the sampled pixels: identifies repeated content. */
+            out->csum = (out->csum ^ v) * 0x100000001b3ull;
+        }
+    }
+}
+
+static uint64_t helios_dmabuf_ino(QemuDmaBuf *dmabuf)
+{
+    const int *fds;
+    struct stat st;
+    int nfds;
+
+    if (!dmabuf) {
+        return 0;
+    }
+    fds = qemu_dmabuf_get_fds(dmabuf, &nfds);
+    if (nfds < 1 || fds[0] < 0 || fstat(fds[0], &st) != 0) {
+        return 0;
+    }
+    return (uint64_t)st.st_ino;
+}
+
 static void egl_vulkan_readback_deactivate(egl_dpy *edpy)
 {
     helios_vulkan_readback_cache_deactivate(edpy->vk_readback_cache,
@@ -89,6 +178,67 @@ egl_vulkan_readback_cache_get(egl_dpy *edpy, QemuDmaBuf *dmabuf,
     return helios_vulkan_readback_cache_activate(edpy->vk_readback_cache,
                                                   dmabuf,
                                                   direct_optimal);
+}
+
+/*
+ * One line per BIND naming the resource, the buffer it is backed by, and the
+ * buffer the chosen readback path actually imported.  Two resource ids that
+ * report the same bound_ino are aliased; a readback whose read_ino differs from
+ * bound_ino is reading a buffer the guest did not bind.
+ */
+static void egl_trace_scanout_bind(QemuDmaBuf *dmabuf,
+                                   HeliosVulkanReadback *readback,
+                                   const char *path)
+{
+    uint64_t read_ino = 0, read_size = 0, reuse = 0;
+    const uint32_t *offsets, *strides;
+    int noffsets, nstrides;
+
+    if (!trace_event_get_state_backends(TRACE_HELIOS_SCANOUT_BIND)) {
+        return;
+    }
+
+    helios_vulkan_readback_identity(readback, &read_ino, &read_size, &reuse);
+    offsets = qemu_dmabuf_get_offsets(dmabuf, &noffsets);
+    strides = qemu_dmabuf_get_strides(dmabuf, &nstrides);
+
+    trace_helios_scanout_bind(qemu_dmabuf_get_source_id(dmabuf),
+                              helios_dmabuf_ino(dmabuf),
+                              qemu_dmabuf_get_allocation_size(dmabuf),
+                              qemu_dmabuf_get_backing_width(dmabuf),
+                              qemu_dmabuf_get_backing_height(dmabuf),
+                              nstrides > 0 ? strides[0] : 0,
+                              noffsets > 0 ? offsets[0] : 0,
+                              read_ino, reuse, path);
+}
+
+/*
+ * One line per FLUSH -- i.e. per frame the host actually publishes -- carrying
+ * both identities and a content verdict for the pixels the VNC encoder is about
+ * to read.  `nonzero == 0` is the black-frame flash of defect 0ab-B; `csum`
+ * distinguishes a genuinely new frame from a re-read of the previous one.
+ */
+static void egl_trace_scanout_read(egl_dpy *edpy, QemuDmaBuf *dmabuf,
+                                   HeliosVulkanReadback *readback,
+                                   uint32_t x, uint32_t y,
+                                   uint32_t w, uint32_t h)
+{
+    HeliosScanoutStats stats;
+    uint64_t read_ino = 0, read_size = 0, reuse = 0;
+
+    if (!trace_event_get_state_backends(TRACE_HELIOS_SCANOUT_READ)) {
+        return;
+    }
+
+    helios_vulkan_readback_identity(readback, &read_ino, &read_size, &reuse);
+    helios_scanout_stats(edpy->ds, x, y, w, h, &stats);
+
+    trace_helios_scanout_read(dmabuf ? qemu_dmabuf_get_source_id(dmabuf) : 0,
+                              helios_dmabuf_ino(dmabuf), read_ino,
+                              (x << 16) | (y & 0xffff),
+                              (w << 16) | (h & 0xffff),
+                              stats.sampled, stats.nonzero, stats.max,
+                              stats.csum, edpy->read_seq++);
 }
 
 static void egl_cpu_dmabuf_unmap(egl_dpy *edpy)
@@ -359,6 +509,7 @@ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
         edpy->vk_readback = egl_vulkan_readback_cache_get(edpy, dmabuf, true);
         if (edpy->vk_readback) {
             edpy->vk_dmabuf = dmabuf;
+            egl_trace_scanout_bind(dmabuf, edpy->vk_readback, "vk-optimal");
             return;
         }
     }
@@ -382,6 +533,9 @@ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
 
         egl_scanout_texture(dcl, texture, false, width, height, 0, 0,
                             width, height, NULL);
+#ifdef CONFIG_LINUX
+        egl_trace_scanout_bind(dmabuf, NULL, "egl-texture");
+#endif
         return;
     }
 
@@ -412,10 +566,13 @@ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
     edpy->vk_readback = egl_vulkan_readback_cache_get(edpy, dmabuf, false);
     if (edpy->vk_readback) {
         edpy->vk_dmabuf = dmabuf;
+        egl_trace_scanout_bind(dmabuf, edpy->vk_readback, "vk-linear");
         return;
     }
 
-    egl_cpu_dmabuf_map(edpy, dmabuf);
+    if (egl_cpu_dmabuf_map(edpy, dmabuf)) {
+        egl_trace_scanout_bind(dmabuf, NULL, "cpu-mmap");
+    }
 #endif
 }
 
@@ -482,12 +639,15 @@ static void egl_scanout_flush(DisplayChangeListener *dcl,
     if (edpy->vk_readback) {
         if (helios_vulkan_readback_flush(edpy->vk_readback, edpy->ds,
                                          x, y, w, h)) {
+            egl_trace_scanout_read(edpy, edpy->vk_dmabuf, edpy->vk_readback,
+                                   x, y, w, h);
             dpy_gfx_update(edpy->dcl.con, x, y, w, h);
         }
         return;
     }
 
     if (egl_cpu_dmabuf_flush(edpy, x, y, w, h)) {
+        egl_trace_scanout_read(edpy, edpy->cpu_dmabuf, NULL, x, y, w, h);
         dpy_gfx_update(edpy->dcl.con, x, y, w, h);
         return;
     }

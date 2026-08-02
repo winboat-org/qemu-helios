@@ -1040,6 +1040,18 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
         return;
     }
 
+    /*
+     * The guest's own view of the buffer, as it arrives (defect 0ab-B).  The
+     * QemuDmaBuf handed to the display backend is always built at offset 0, so
+     * a nonzero guest offset here would mean the host reads the wrong bytes --
+     * that has to be visible, not assumed away.
+     */
+    trace_helios_scanout_blob_layout(ss.scanout_id, ss.resource_id,
+                                     res->base.dmabuf_fd, res->base.blob_size,
+                                     ss.offsets[0], fb.offset, fb.stride,
+                                     ss.r.width, ss.r.height,
+                                     res->dmabuf_modifier);
+
     g->parent_obj.enable = 1;
     if (virtio_gpu_update_dmabuf(g, ss.scanout_id, &res->base, &fb, &ss.r,
                                  res->dmabuf_modifier)) {

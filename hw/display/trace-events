@@ -226,3 +226,6 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 
+
+# virtio-gpu-virgl.c -- Helios scan-out oracle (defect 0ab-B)
+helios_scanout_blob_layout(uint32_t scanout, uint32_t res, int fd, uint64_t blob_size, uint32_t guest_offset, uint32_t fb_offset, uint32_t stride, uint32_t w, uint32_t h, uint64_t modifier) "scanout %u res %u fd %d blob_size %"PRIu64" guest_offset %u fb_offset %u stride %u %ux%u modifier 0x%"PRIx64
