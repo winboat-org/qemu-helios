@@ -36,6 +36,8 @@ uint32_t qemu_dmabuf_get_num_planes(QemuDmaBuf *dmabuf);
 uint32_t qemu_dmabuf_get_fourcc(QemuDmaBuf *dmabuf);
 uint64_t qemu_dmabuf_get_modifier(QemuDmaBuf *dmabuf);
 uint64_t qemu_dmabuf_get_allocation_size(QemuDmaBuf *dmabuf);
+uint32_t qemu_dmabuf_get_source_id(QemuDmaBuf *dmabuf);
+void qemu_dmabuf_set_source_id(QemuDmaBuf *dmabuf, uint32_t source_id);
 uint32_t qemu_dmabuf_get_texture(QemuDmaBuf *dmabuf);
 uint32_t qemu_dmabuf_get_x(QemuDmaBuf *dmabuf);
 uint32_t qemu_dmabuf_get_y(QemuDmaBuf *dmabuf);

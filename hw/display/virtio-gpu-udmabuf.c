@@ -205,6 +205,7 @@ static VGPUDMABuf
                                   modifier, &res->dmabuf_fd,
                                   1, true, false);
     qemu_dmabuf_set_allocation_size(dmabuf->buf, res->blob_size);
+    qemu_dmabuf_set_source_id(dmabuf->buf, res->resource_id);
     dmabuf->scanout_id = scanout_id;
     QTAILQ_INSERT_HEAD(&g->dmabuf.bufs, dmabuf, next);
 
