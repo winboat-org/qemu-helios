@@ -57,6 +57,7 @@ struct virtio_gpu_simple_resource {
     uint64_t hostmem;
 
     uint64_t blob_size;
+    uint64_t host3d_blob_charge;
     void *blob;
     int dmabuf_fd;
     uint8_t *remapped;
@@ -189,6 +190,8 @@ struct VirtIOGPU {
 
     uint8_t scanout_vmstate_version;
     uint64_t conf_max_hostmem;
+    uint64_t conf_host3d_blob_limit;
+    uint64_t host3d_blob_bytes;
 
     VirtQueue *ctrl_vq;
     VirtQueue *cursor_vq;
