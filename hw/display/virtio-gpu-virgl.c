@@ -65,6 +65,39 @@ virtio_gpu_virgl_find_resource(VirtIOGPU *g, uint32_t resource_id)
     return container_of(res, struct virtio_gpu_virgl_resource, base);
 }
 
+static bool virtio_gpu_virgl_host3d_blob_fits(VirtIOGPU *g, uint64_t size)
+{
+    uint64_t limit = g->conf_host3d_blob_limit;
+
+    return !limit || (size <= limit && g->host3d_blob_bytes <= limit - size);
+}
+
+static void
+virtio_gpu_virgl_host3d_blob_uncharge(VirtIOGPU *g,
+                                      struct virtio_gpu_virgl_resource *res)
+{
+    uint64_t charge = res->base.host3d_blob_charge;
+
+    if (!charge) {
+        return;
+    }
+
+    if (charge > g->host3d_blob_bytes) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: invalid HOST3D blob accounting: charge=%" PRIu64
+                      " used=%" PRIu64 "\n",
+                      __func__, charge, g->host3d_blob_bytes);
+        g->host3d_blob_bytes = 0;
+    } else {
+        g->host3d_blob_bytes -= charge;
+    }
+    trace_virtio_gpu_virgl_host3d_blob_uncharge(res->base.resource_id,
+                                                charge,
+                                                g->host3d_blob_bytes,
+                                                g->conf_host3d_blob_limit);
+    res->base.host3d_blob_charge = 0;
+}
+
 #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
 static void *
 virgl_get_egl_display(G_GNUC_UNUSED void *cookie)
@@ -433,6 +466,8 @@ virtio_gpu_virgl_resource_unref(VirtIOGPU *g,
         virtio_gpu_cleanup_mapping_iov(g, res_iovs, num_iovs);
     }
     virgl_renderer_resource_unref(res->base.resource_id);
+
+    virtio_gpu_virgl_host3d_blob_uncharge(g, res);
 
     QTAILQ_REMOVE(&g->reslist, &res->base, next);
 
@@ -853,6 +888,19 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
             cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
             return;
         }
+    } else if (!virtio_gpu_virgl_host3d_blob_fits(g, cblob.size)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: HOST3D blob budget exceeded: resource=%u"
+                      " requested=%" PRIu64 " used=%" PRIu64
+                      " limit=%" PRIu64 "\n",
+                      __func__, cblob.resource_id, cblob.size,
+                      g->host3d_blob_bytes, g->conf_host3d_blob_limit);
+        trace_virtio_gpu_virgl_host3d_blob_reject(cblob.resource_id,
+                                                  cblob.size,
+                                                  g->host3d_blob_bytes,
+                                                  g->conf_host3d_blob_limit);
+        cmd->error = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+        return;
     }
 
     virgl_args.res_handle = cblob.resource_id;
@@ -899,6 +947,15 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
     }
 
     res->base.dmabuf_fd = info.fd;
+
+    if (cblob.blob_mem == VIRTIO_GPU_BLOB_MEM_HOST3D) {
+        res->base.host3d_blob_charge = cblob.size;
+        g->host3d_blob_bytes += cblob.size;
+        trace_virtio_gpu_virgl_host3d_blob_charge(cblob.resource_id,
+                                                  cblob.size,
+                                                  g->host3d_blob_bytes,
+                                                  g->conf_host3d_blob_limit);
+    }
 
     /* Now live, cleaned up in virtio_gpu_virgl_resource_unref */
     QTAILQ_INSERT_HEAD(&g->reslist, &res->base, next);
