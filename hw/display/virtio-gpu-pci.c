@@ -13,6 +13,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/host-utils.h"
 #include "qemu/module.h"
 #include "hw/pci/pci.h"
 #include "hw/core/qdev-properties.h"
@@ -30,13 +31,24 @@ static void virtio_gpu_pci_base_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
     VirtIOGPUPCIBase *vgpu = VIRTIO_GPU_PCI_BASE(vpci_dev);
     VirtIOGPUBase *g = vgpu->vgpu;
     DeviceState *vdev = DEVICE(g);
+    uint64_t hostmem_bar_size;
     int i;
 
     if (virtio_gpu_hostmem_enabled(g->conf)) {
+        /*
+         * PCI BAR sizes must be powers of two, but the virtio shared-memory
+         * region inside the BAR may have an arbitrary length.  Keep hostmem
+         * exact for the capability and backing store while padding only BAR4.
+         */
+        hostmem_bar_size = pow2ceil(g->conf.hostmem);
+        if (!hostmem_bar_size) {
+            error_setg(errp, "virtio-gpu hostmem size is too large");
+            return;
+        }
         vpci_dev->msix_bar_idx = 1;
         vpci_dev->modern_mem_bar_idx = 2;
         memory_region_init(&g->hostmem, OBJECT(g), "virtio-gpu-hostmem",
-                           g->conf.hostmem);
+                           hostmem_bar_size);
         pci_register_bar(&vpci_dev->pci_dev, 4,
                          PCI_BASE_ADDRESS_SPACE_MEMORY |
                          PCI_BASE_ADDRESS_MEM_PREFETCH |
