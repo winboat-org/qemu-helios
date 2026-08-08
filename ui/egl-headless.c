@@ -32,6 +32,14 @@ typedef struct egl_dpy {
     HeliosVulkanReadback *vk_readback;
     QemuDmaBuf *vk_dmabuf;
     HeliosVulkanReadbackCache *vk_readback_cache;
+    QEMUTimer *vk_publish_timer;
+    int64_t vk_next_publish_ns;
+    bool vk_pending;
+    uint32_t vk_pending_x;
+    uint32_t vk_pending_y;
+    uint32_t vk_pending_width;
+    uint32_t vk_pending_height;
+    bool force_full_update;
     QemuDmaBuf *cpu_dmabuf;
     void *cpu_map;
     size_t cpu_map_len;
@@ -70,10 +78,8 @@ static void egl_gfx_switch(DisplayChangeListener *dcl,
 /*
  * Helios scan-out oracle (defect 0ab-B).
  *
- * Per FLUSH -- not per sample -- record what the host actually put on screen and
- * which guest buffer it came out of.  The VNC-side sampler tops out at ~30/s
- * while a fullscreen workload flushes at ~142/s, so it cannot resolve a single
- * displayed frame; this can, because it runs inside the flush itself.
+ * Per published remote frame, record what the host actually put on screen and
+ * which guest buffer it came out of.
  *
  * Two identities are emitted deliberately:
  *   bound_ino -- the DMA-BUF inode of the resource the guest currently has bound
@@ -155,10 +161,15 @@ static uint64_t helios_dmabuf_ino(QemuDmaBuf *dmabuf)
 
 static void egl_vulkan_readback_deactivate(egl_dpy *edpy)
 {
+    if (edpy->vk_publish_timer) {
+        timer_del(edpy->vk_publish_timer);
+    }
     helios_vulkan_readback_cache_deactivate(edpy->vk_readback_cache,
                                             edpy->vk_dmabuf);
     edpy->vk_readback = NULL;
     edpy->vk_dmabuf = NULL;
+    edpy->vk_pending = false;
+    edpy->force_full_update = true;
 }
 
 static void egl_vulkan_readback_cache_clear(egl_dpy *edpy)
@@ -166,6 +177,8 @@ static void egl_vulkan_readback_cache_clear(egl_dpy *edpy)
     egl_vulkan_readback_deactivate(edpy);
     g_clear_pointer(&edpy->vk_readback_cache,
                     helios_vulkan_readback_cache_free);
+    edpy->vk_next_publish_ns = 0;
+    edpy->vk_pending = false;
 }
 
 static HeliosVulkanReadback *
@@ -213,7 +226,7 @@ static void egl_trace_scanout_bind(QemuDmaBuf *dmabuf,
 }
 
 /*
- * One line per FLUSH -- i.e. per frame the host actually publishes -- carrying
+ * One line per frame the host actually publishes, carrying
  * both identities and a content verdict for the pixels the VNC encoder is about
  * to read.  `nonzero == 0` is the black-frame flash of defect 0ab-B; `csum`
  * distinguishes a genuinely new frame from a re-read of the previous one.
@@ -239,6 +252,78 @@ static void egl_trace_scanout_read(egl_dpy *edpy, QemuDmaBuf *dmabuf,
                               (w << 16) | (h & 0xffff),
                               stats.sampled, stats.nonzero, stats.max,
                               stats.csum, edpy->read_seq++);
+}
+
+/*
+ * VNC's default refresh interval is 30 ms. Capturing every guest flush is
+ * still required for external ownership and to preserve the newest/final
+ * frame, but publishing device-local snapshots to host RAM any faster only
+ * creates work the remote display cannot consume.
+ */
+#define HELIOS_VK_PUBLISH_INTERVAL_NS (30 * SCALE_MS)
+
+static bool egl_vulkan_pending_union(egl_dpy *edpy,
+                                     uint32_t x, uint32_t y,
+                                     uint32_t width, uint32_t height,
+                                     uint32_t *out_x, uint32_t *out_y,
+                                     uint32_t *out_width,
+                                     uint32_t *out_height)
+{
+    uint32_t x2, y2;
+
+    if (!width || !height || !edpy->ds ||
+        x >= surface_width(edpy->ds) || y >= surface_height(edpy->ds)) {
+        return false;
+    }
+    width = MIN(width, (uint32_t)surface_width(edpy->ds) - x);
+    height = MIN(height, (uint32_t)surface_height(edpy->ds) - y);
+
+    if (!edpy->vk_pending) {
+        *out_x = x;
+        *out_y = y;
+        *out_width = width;
+        *out_height = height;
+        return true;
+    }
+
+    x2 = MAX(edpy->vk_pending_x + edpy->vk_pending_width, x + width);
+    y2 = MAX(edpy->vk_pending_y + edpy->vk_pending_height, y + height);
+    *out_x = MIN(edpy->vk_pending_x, x);
+    *out_y = MIN(edpy->vk_pending_y, y);
+    *out_width = x2 - *out_x;
+    *out_height = y2 - *out_y;
+    return true;
+}
+
+static void egl_vulkan_publish_timer(void *opaque)
+{
+    egl_dpy *edpy = opaque;
+    int64_t now;
+    uint32_t x, y, width, height;
+    HeliosVulkanReadbackRect rect;
+
+    if (!edpy->vk_pending || !edpy->vk_readback ||
+        !edpy->vk_dmabuf || !edpy->ds) {
+        return;
+    }
+    x = edpy->vk_pending_x;
+    y = edpy->vk_pending_y;
+    width = edpy->vk_pending_width;
+    height = edpy->vk_pending_height;
+    rect = (HeliosVulkanReadbackRect) { x, y, width, height };
+    if (!helios_vulkan_readback_publish(edpy->vk_readback, edpy->ds, &rect)) {
+        /* Do not turn a permanent device error into a main-loop retry storm. */
+        edpy->vk_pending = false;
+        edpy->force_full_update = true;
+        return;
+    }
+
+    edpy->vk_pending = false;
+    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    edpy->vk_next_publish_ns = now + HELIOS_VK_PUBLISH_INTERVAL_NS;
+    egl_trace_scanout_read(edpy, edpy->vk_dmabuf, edpy->vk_readback,
+                           x, y, width, height);
+    qemu_console_update(edpy->dcl.con, x, y, width, height);
 }
 
 static void egl_cpu_dmabuf_unmap(egl_dpy *edpy)
@@ -495,8 +580,13 @@ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
     uint32_t width, height, texture;
 #ifdef CONFIG_LINUX
     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
+    bool same_readback =
+        helios_vulkan_readback_matches(edpy->vk_readback, dmabuf, true) ||
+        helios_vulkan_readback_matches(edpy->vk_readback, dmabuf, false);
 
-    egl_vulkan_readback_deactivate(edpy);
+    if (!same_readback) {
+        egl_vulkan_readback_deactivate(edpy);
+    }
     egl_cpu_dmabuf_unmap(edpy);
 
     /*
@@ -523,6 +613,11 @@ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
     glGetError();
     texture = qemu_dmabuf_get_texture(dmabuf);
     if (texture) {
+#ifdef CONFIG_LINUX
+        if (edpy->vk_readback) {
+            egl_vulkan_readback_deactivate(edpy);
+        }
+#endif
         width = qemu_dmabuf_get_width(dmabuf);
         height = qemu_dmabuf_get_height(dmabuf);
 
@@ -636,19 +731,66 @@ static void egl_scanout_flush(DisplayChangeListener *dcl,
     assert(surface_format(edpy->ds) == PIXMAN_x8r8g8b8);
 
 #if defined(CONFIG_GBM) && defined(CONFIG_LINUX)
+    if (edpy->force_full_update) {
+        x = 0;
+        y = 0;
+        w = surface_width(edpy->ds);
+        h = surface_height(edpy->ds);
+    }
+
     if (edpy->vk_readback) {
-        if (helios_vulkan_readback_flush(edpy->vk_readback, edpy->ds,
-                                         x, y, w, h)) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        bool publish = !edpy->vk_next_publish_ns ||
+                       now >= edpy->vk_next_publish_ns;
+        uint32_t pending_x, pending_y, pending_width, pending_height;
+        HeliosVulkanReadbackRect capture_rect, publish_rect;
+
+        if (!egl_vulkan_pending_union(edpy, x, y, w, h,
+                                      &pending_x, &pending_y,
+                                      &pending_width, &pending_height)) {
+            return;
+        }
+        capture_rect = (HeliosVulkanReadbackRect) { x, y, w, h };
+        publish_rect = (HeliosVulkanReadbackRect) {
+            pending_x, pending_y, pending_width, pending_height,
+        };
+        if (!helios_vulkan_readback_capture(
+                edpy->vk_readback, edpy->ds, &capture_rect,
+                publish ? &publish_rect : NULL)) {
+            timer_del(edpy->vk_publish_timer);
+            edpy->vk_pending = false;
+            edpy->force_full_update = true;
+            return;
+        }
+
+        edpy->force_full_update = false;
+        if (publish) {
+            edpy->vk_pending = false;
+            edpy->vk_next_publish_ns =
+                qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                HELIOS_VK_PUBLISH_INTERVAL_NS;
+            timer_del(edpy->vk_publish_timer);
             egl_trace_scanout_read(edpy, edpy->vk_dmabuf, edpy->vk_readback,
-                                   x, y, w, h);
-            dpy_gfx_update(edpy->dcl.con, x, y, w, h);
+                                   pending_x, pending_y,
+                                   pending_width, pending_height);
+            qemu_console_update(edpy->dcl.con, pending_x, pending_y,
+                                pending_width, pending_height);
+        } else {
+            edpy->vk_pending = true;
+            edpy->vk_pending_x = pending_x;
+            edpy->vk_pending_y = pending_y;
+            edpy->vk_pending_width = pending_width;
+            edpy->vk_pending_height = pending_height;
+            timer_mod_ns(edpy->vk_publish_timer,
+                         edpy->vk_next_publish_ns);
         }
         return;
     }
 
     if (egl_cpu_dmabuf_flush(edpy, x, y, w, h)) {
         egl_trace_scanout_read(edpy, edpy->cpu_dmabuf, NULL, x, y, w, h);
-        dpy_gfx_update(edpy->dcl.con, x, y, w, h);
+        qemu_console_update(edpy->dcl.con, x, y, w, h);
+        edpy->force_full_update = false;
         return;
     }
 #endif
@@ -671,6 +813,9 @@ static void egl_scanout_flush(DisplayChangeListener *dcl,
 
     egl_fb_read(edpy->ds, &edpy->blit_fb);
     qemu_console_update(edpy->dcl.con, x, y, w, h);
+#if defined(CONFIG_GBM) && defined(CONFIG_LINUX)
+    edpy->force_full_update = false;
+#endif
 }
 
 static const DisplayChangeListenerOps egl_ops = {
@@ -741,6 +886,11 @@ static void egl_headless_init(DisplayState *ds, DisplayOptions *opts)
 
         edpy = g_new0(egl_dpy, 1);
         edpy->gls = qemu_gl_init_shader();
+#if defined(CONFIG_GBM) && defined(CONFIG_LINUX)
+        edpy->vk_publish_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                              egl_vulkan_publish_timer,
+                                              edpy);
+#endif
         ctx = g_new0(DisplayGLCtx, 1);
         ctx->ops = &eglctx_ops;
         edpy->ctx = ctx;
