@@ -70,6 +70,7 @@ static QTAILQ_HEAD(, VncDisplay) vnc_displays =
 
 static int vnc_cursor_define(VncState *vs);
 static void vnc_update_throttle_offset(VncState *vs);
+static VncRectStat *vnc_stat_rect(VncDisplay *vd, int x, int y);
 
 static void vnc_set_share_mode(VncState *vs, VncShareMode mode)
 {
@@ -1144,12 +1145,67 @@ static bool vnc_should_update(VncState *vs)
     return false;
 }
 
+/*
+ * Tight's adaptive JPEG mode already tracks motion in 64x64 regions.  Expand
+ * dirty pixels inside regions which are hot enough to be forced to JPEG so the
+ * encoder and client receive a few useful rectangles instead of thousands of
+ * scanline fragments.  Static and lossless updates retain exact damage.
+ */
+static int vnc_coalesce_lossy_dirty(VncState *vs, int width, int height)
+{
+    VncConnection *vc = container_of(vs, VncConnection, vs);
+    int blocks = 0;
+    int x, y;
+
+    if (!vs->vd->lossy || vs->vd->non_adaptive ||
+        vs->vnc_encoding != VNC_ENCODING_TIGHT) {
+        return 0;
+    }
+
+    for (y = 0; y < height; y += VNC_STAT_RECT) {
+        int block_height = MIN(VNC_STAT_RECT, height - y);
+
+        for (x = 0; x < width; x += VNC_STAT_RECT) {
+            VncRectStat *rect = vnc_stat_rect(vs->vd, x, y);
+            int block_width = MIN(VNC_STAT_RECT, width - x);
+            int first_bit = x / VNC_DIRTY_PIXELS_PER_BIT;
+            int bit_count = DIV_ROUND_UP(block_width,
+                                         VNC_DIRTY_PIXELS_PER_BIT);
+            bool dirty = false;
+            int row;
+
+            if (!vnc_tight_should_force_jpeg(&vc->worker, rect->freq)) {
+                continue;
+            }
+
+            for (row = y; row < y + block_height; row++) {
+                if (find_next_bit(vs->dirty[row], first_bit + bit_count,
+                                  first_bit) < first_bit + bit_count) {
+                    dirty = true;
+                    break;
+                }
+            }
+            if (!dirty) {
+                continue;
+            }
+
+            for (row = y; row < y + block_height; row++) {
+                bitmap_set(vs->dirty[row], first_bit, bit_count);
+            }
+            blocks++;
+        }
+    }
+
+    return blocks;
+}
+
 static int vnc_update_client(VncState *vs, int has_dirty)
 {
     VncDisplay *vd = vs->vd;
     VncJob *job;
     int y;
     int height, width;
+    int coalesced;
     int n = 0;
 
     if (vs->disconnecting) {
@@ -1176,6 +1232,12 @@ static int vnc_update_client(VncState *vs, int has_dirty)
 
     height = pixman_image_get_height(vd->server);
     width = pixman_image_get_width(vd->server);
+
+    coalesced = vnc_coalesce_lossy_dirty(vs, width, height);
+
+    if (coalesced) {
+        trace_vnc_client_lossy_coalesce(vs, coalesced, width, height);
+    }
 
     y = 0;
     for (;;) {

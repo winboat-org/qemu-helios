@@ -632,6 +632,7 @@ int vnc_tight_send_framebuffer_update(VncState *vs, VncWorker *worker,
                                       int x, int y, int w, int h);
 int vnc_tight_png_send_framebuffer_update(VncState *vs, VncWorker *worker,
                                           int x, int y, int w, int h);
+bool vnc_tight_should_force_jpeg(VncWorker *worker, double freq);
 void vnc_tight_clear(VncWorker *worker);
 
 int vnc_zrle_send_framebuffer_update(VncState *vs, VncWorker *worker,

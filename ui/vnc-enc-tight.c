@@ -95,6 +95,20 @@ static const struct {
 };
 #endif
 
+bool vnc_tight_should_force_jpeg(VncWorker *worker, double freq)
+{
+#ifdef CONFIG_VNC_JPEG
+    uint8_t quality = worker->tight.quality;
+
+    return quality != (uint8_t)-1 &&
+           freq >= tight_jpeg_conf[quality].jpeg_freq_threshold;
+#else
+    (void)worker;
+    (void)freq;
+    return false;
+#endif
+}
+
 #ifdef CONFIG_PNG
 static const struct {
     int png_zlib_level, png_filters;
@@ -1524,7 +1538,7 @@ static int send_sub_rect(VncState *vs, VncWorker *worker,
         if (freq < tight_jpeg_conf[tight->quality].jpeg_freq_min) {
             allow_jpeg = false;
         }
-        if (freq >= tight_jpeg_conf[tight->quality].jpeg_freq_threshold) {
+        if (vnc_tight_should_force_jpeg(worker, freq)) {
             force_jpeg = true;
             vnc_sent_lossy_rect(worker, x, y, w, h);
         }
@@ -1692,7 +1706,7 @@ static int tight_send_framebuffer_update(VncState *vs, VncWorker *worker,
     if (worker->tight.quality != (uint8_t)-1) {
         double freq = vnc_update_freq(vs, x, y, w, h);
 
-        if (freq > tight_jpeg_conf[worker->tight.quality].jpeg_freq_threshold) {
+        if (vnc_tight_should_force_jpeg(worker, freq)) {
             return send_rect_simple(vs, worker, x, y, w, h, false);
         }
     }
