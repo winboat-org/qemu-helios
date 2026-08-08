@@ -4,6 +4,7 @@
 #include "ui/console.h"
 #include "ui/vulkan-readback.h"
 #include "standard-headers/drm/drm_fourcc.h"
+#include "trace.h"
 
 #include <vulkan/vulkan.h>
 
@@ -16,6 +17,8 @@ struct HeliosVulkanReadback {
     uint32_t queue_family;
     VkImage image;
     VkDeviceMemory image_memory;
+    VkBuffer snapshot;
+    VkDeviceMemory snapshot_memory;
     VkBuffer staging;
     VkDeviceMemory staging_memory;
     VkCommandPool command_pool;
@@ -24,8 +27,12 @@ struct HeliosVulkanReadback {
     uint8_t *staging_map;
     uint32_t backing_width;
     uint32_t backing_height;
+    uint32_t visible_width;
+    uint32_t visible_height;
     uint32_t origin_x;
     uint32_t origin_y;
+    uint32_t fourcc;
+    uint64_t modifier;
     dev_t dmabuf_dev;
     ino_t dmabuf_ino;
     uint64_t dmabuf_size;
@@ -33,7 +40,9 @@ struct HeliosVulkanReadback {
     bool external_ownership;
     bool direct_optimal;
     bool swap_red_blue;
+    bool failed;
     uint64_t flushes;
+    uint64_t publishes;
 };
 
 #define HELIOS_VK_READBACK_CACHE_SIZE 8
@@ -135,9 +144,16 @@ bool helios_vulkan_readback_matches(HeliosVulkanReadback *readback,
     struct stat st;
     int nfds;
 
-    if (!readback || !dmabuf || readback->direct_optimal != direct_optimal ||
+    if (!readback || readback->failed || !dmabuf ||
+        readback->direct_optimal != direct_optimal ||
         readback->backing_width != qemu_dmabuf_get_backing_width(dmabuf) ||
-        readback->backing_height != qemu_dmabuf_get_backing_height(dmabuf)) {
+        readback->backing_height != qemu_dmabuf_get_backing_height(dmabuf) ||
+        readback->visible_width != qemu_dmabuf_get_width(dmabuf) ||
+        readback->visible_height != qemu_dmabuf_get_height(dmabuf) ||
+        readback->origin_x != qemu_dmabuf_get_x(dmabuf) ||
+        readback->origin_y != qemu_dmabuf_get_y(dmabuf) ||
+        readback->fourcc != qemu_dmabuf_get_fourcc(dmabuf) ||
+        readback->modifier != qemu_dmabuf_get_modifier(dmabuf)) {
         return false;
     }
 
@@ -187,6 +203,12 @@ void helios_vulkan_readback_free(HeliosVulkanReadback *readback)
     }
     if (readback->staging_memory) {
         vkFreeMemory(readback->device, readback->staging_memory, NULL);
+    }
+    if (readback->snapshot) {
+        vkDestroyBuffer(readback->device, readback->snapshot, NULL);
+    }
+    if (readback->snapshot_memory) {
+        vkFreeMemory(readback->device, readback->snapshot_memory, NULL);
     }
     if (readback->image) {
         vkDestroyImage(readback->device, readback->image, NULL);
@@ -255,8 +277,12 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
     readback->dmabuf = dmabuf;
     readback->backing_width = qemu_dmabuf_get_backing_width(dmabuf);
     readback->backing_height = qemu_dmabuf_get_backing_height(dmabuf);
+    readback->visible_width = qemu_dmabuf_get_width(dmabuf);
+    readback->visible_height = qemu_dmabuf_get_height(dmabuf);
     readback->origin_x = qemu_dmabuf_get_x(dmabuf);
     readback->origin_y = qemu_dmabuf_get_y(dmabuf);
+    readback->fourcc = fourcc;
+    readback->modifier = modifier;
     {
         struct stat st;
 
@@ -274,7 +300,14 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
         ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
         : VK_IMAGE_LAYOUT_GENERAL;
     readback->external_ownership = direct_optimal;
-    if (!readback->backing_width || !readback->backing_height) {
+    if (!readback->backing_width || !readback->backing_height ||
+        !readback->visible_width || !readback->visible_height ||
+        readback->origin_x >= readback->backing_width ||
+        readback->origin_y >= readback->backing_height ||
+        readback->visible_width >
+            readback->backing_width - readback->origin_x ||
+        readback->visible_height >
+            readback->backing_height - readback->origin_y) {
         goto fail;
     }
 
@@ -491,9 +524,33 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
     VkBufferCreateInfo buffer_info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = staging_size,
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
+    VK_NEW(vkCreateBuffer(readback->device, &buffer_info, NULL,
+                          &readback->snapshot));
+    VkMemoryRequirements snapshot_requirements;
+    vkGetBufferMemoryRequirements(readback->device, readback->snapshot,
+                                  &snapshot_requirements);
+    uint32_t snapshot_memory_type = find_memory_type(
+        readback->physical_device, snapshot_requirements.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (snapshot_memory_type == UINT32_MAX) {
+        error_report("vulkan-readback: no device-local snapshot memory type");
+        goto fail;
+    }
+    VkMemoryAllocateInfo snapshot_memory_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = snapshot_requirements.size,
+        .memoryTypeIndex = snapshot_memory_type,
+    };
+    VK_NEW(vkAllocateMemory(readback->device, &snapshot_memory_info, NULL,
+                            &readback->snapshot_memory));
+    VK_NEW(vkBindBufferMemory(readback->device, readback->snapshot,
+                              readback->snapshot_memory, 0));
+
+    buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VK_NEW(vkCreateBuffer(readback->device, &buffer_info, NULL,
                           &readback->staging));
     VkMemoryRequirements staging_requirements;
@@ -558,39 +615,129 @@ fail:
 #undef VK_NEW
 }
 
-bool helios_vulkan_readback_flush(HeliosVulkanReadback *readback,
-                                  DisplaySurface *surface,
-                                  uint32_t x, uint32_t y,
-                                  uint32_t width, uint32_t height)
+static void helios_vulkan_readback_copy_to_surface(
+    HeliosVulkanReadback *readback, DisplaySurface *surface,
+    uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+{
+    uint32_t src_x = readback->origin_x + x;
+    uint32_t src_y = readback->origin_y + y;
+    uint8_t *src = readback->staging_map +
+        ((size_t)src_y * readback->backing_width + src_x) * 4;
+    uint8_t *dst = surface_data(surface) +
+        (size_t)y * surface_stride(surface) + (size_t)x * 4;
+
+    for (uint32_t row = 0; row < height; row++) {
+        if (readback->swap_red_blue) {
+            for (uint32_t col = 0; col < width; col++) {
+                dst[col * 4 + 0] = src[col * 4 + 2];
+                dst[col * 4 + 1] = src[col * 4 + 1];
+                dst[col * 4 + 2] = src[col * 4 + 0];
+                dst[col * 4 + 3] = src[col * 4 + 3];
+            }
+        } else {
+            memcpy(dst, src, (size_t)width * 4);
+        }
+        src += (size_t)readback->backing_width * 4;
+        dst += surface_stride(surface);
+    }
+}
+
+static bool helios_vulkan_readback_clip_rect(
+    HeliosVulkanReadback *readback, DisplaySurface *surface,
+    const HeliosVulkanReadbackRect *rect,
+    HeliosVulkanReadbackRect *clipped)
+{
+    if (!readback || !surface || !rect || !rect->width || !rect->height ||
+        rect->x >= surface_width(surface) ||
+        rect->y >= surface_height(surface) ||
+        rect->x >= readback->visible_width ||
+        rect->y >= readback->visible_height) {
+        return false;
+    }
+
+    *clipped = *rect;
+    clipped->width = MIN(
+        clipped->width,
+        MIN(readback->visible_width - clipped->x,
+            (uint32_t)surface_width(surface) - clipped->x));
+    clipped->height = MIN(
+        clipped->height,
+        MIN(readback->visible_height - clipped->y,
+            (uint32_t)surface_height(surface) - clipped->y));
+    return true;
+}
+
+static void helios_vulkan_readback_record_publish(
+    HeliosVulkanReadback *readback)
+{
+    VkDeviceSize size = (VkDeviceSize)readback->backing_width *
+                        readback->backing_height * 4;
+    VkBufferMemoryBarrier snapshot = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = readback->snapshot,
+        .offset = 0,
+        .size = size,
+    };
+    VkBufferCopy copy = {
+        .size = size,
+    };
+    VkBufferMemoryBarrier host = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = readback->staging,
+        .offset = 0,
+        .size = size,
+    };
+
+    vkCmdPipelineBarrier(readback->command_buffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, NULL, 1, &snapshot, 0, NULL);
+    vkCmdCopyBuffer(readback->command_buffer, readback->snapshot,
+                    readback->staging, 1, &copy);
+    vkCmdPipelineBarrier(readback->command_buffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0,
+                         0, NULL, 1, &host, 0, NULL);
+}
+
+bool helios_vulkan_readback_capture(HeliosVulkanReadback *readback,
+                                    DisplaySurface *surface,
+                                    const HeliosVulkanReadbackRect *capture,
+                                    const HeliosVulkanReadbackRect *publish)
 {
     VkResult result;
     int64_t start_ns, submit_ns, wait_ns, copy_ns;
-    uint32_t src_x, src_y, row;
-    uint8_t *src, *dst;
+    uint32_t src_x, src_y;
+    HeliosVulkanReadbackRect captured, published;
 
 #define VK_FLUSH(call) do {                                                 \
     result = (call);                                                        \
     if (result != VK_SUCCESS) {                                             \
         error_report("vulkan-readback: %s failed: %d", #call, result);     \
+        readback->failed = true;                                            \
         return false;                                                       \
     }                                                                       \
 } while (0)
 
-    if (!readback || !surface || !width || !height ||
-        x >= surface_width(surface) || y >= surface_height(surface)) {
+    if (!readback || readback->failed ||
+        !helios_vulkan_readback_clip_rect(readback, surface,
+                                          capture, &captured) ||
+        (publish &&
+         !helios_vulkan_readback_clip_rect(readback, surface,
+                                           publish, &published))) {
         return false;
     }
 
-    src_x = readback->origin_x + x;
-    src_y = readback->origin_y + y;
-    if (src_x >= readback->backing_width ||
-        src_y >= readback->backing_height) {
-        return false;
-    }
-    width = MIN(width, MIN(readback->backing_width - src_x,
-                           (uint32_t)surface_width(surface) - x));
-    height = MIN(height, MIN(readback->backing_height - src_y,
-                             (uint32_t)surface_height(surface) - y));
+    src_x = readback->origin_x + captured.x;
+    src_y = readback->origin_y + captured.y;
 
     start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     VK_FLUSH(vkResetFences(readback->device, 1, &readback->fence));
@@ -635,11 +782,11 @@ bool helios_vulkan_readback_flush(HeliosVulkanReadback *readback,
             .layerCount = 1,
         },
         .imageOffset = { src_x, src_y, 0 },
-        .imageExtent = { width, height, 1 },
+        .imageExtent = { captured.width, captured.height, 1 },
     };
     vkCmdCopyImageToBuffer(readback->command_buffer, readback->image,
                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           readback->staging, 1, &region);
+                           readback->snapshot, 1, &region);
 
     VkImageMemoryBarrier release = acquire;
     release.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -652,22 +799,14 @@ bool helios_vulkan_readback_flush(HeliosVulkanReadback *readback,
     release.dstQueueFamilyIndex = readback->external_ownership
         ? VK_QUEUE_FAMILY_EXTERNAL
         : VK_QUEUE_FAMILY_IGNORED;
-    VkBufferMemoryBarrier host = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = readback->staging,
-        .offset = region.bufferOffset,
-        .size = (VkDeviceSize)(height - 1) * readback->backing_width * 4 +
-                (VkDeviceSize)width * 4,
-    };
     vkCmdPipelineBarrier(readback->command_buffer,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT |
-                         VK_PIPELINE_STAGE_HOST_BIT, 0,
-                         0, NULL, 1, &host, 1, &release);
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                         0, NULL, 0, NULL, 1, &release);
+
+    if (publish) {
+        helios_vulkan_readback_record_publish(readback);
+    }
     VK_FLUSH(vkEndCommandBuffer(readback->command_buffer));
 
     VkSubmitInfo submit_info = {
@@ -682,32 +821,27 @@ bool helios_vulkan_readback_flush(HeliosVulkanReadback *readback,
                              VK_TRUE, UINT64_MAX));
     wait_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
-    src = readback->staging_map +
-          ((size_t)src_y * readback->backing_width + src_x) * 4;
-    dst = surface_data(surface) + (size_t)y * surface_stride(surface) +
-          (size_t)x * 4;
-    for (row = 0; row < height; row++) {
-        if (readback->swap_red_blue) {
-            for (uint32_t col = 0; col < width; col++) {
-                dst[col * 4 + 0] = src[col * 4 + 2];
-                dst[col * 4 + 1] = src[col * 4 + 1];
-                dst[col * 4 + 2] = src[col * 4 + 0];
-                dst[col * 4 + 3] = src[col * 4 + 3];
-            }
-        } else {
-            memcpy(dst, src, (size_t)width * 4);
-        }
-        src += (size_t)readback->backing_width * 4;
-        dst += surface_stride(surface);
+    if (publish) {
+        helios_vulkan_readback_copy_to_surface(readback, surface,
+                                               published.x, published.y,
+                                               published.width,
+                                               published.height);
+        readback->publishes++;
     }
     copy_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
     readback->flushes++;
-    if (readback->flushes == 1 || copy_ns - start_ns > 50000000) {
-        error_report("vulkan-readback: flush #%" PRIu64
-                     " %ux%u submit=%.3f ms wait=%.3f ms copy=%.3f ms "
-                     "total=%.3f ms",
-                     readback->flushes, width, height,
+    trace_helios_vulkan_capture(
+        readback->dmabuf_ino, readback->flushes, publish != NULL,
+        captured.width, captured.height,
+        submit_ns - start_ns, wait_ns - submit_ns, copy_ns - wait_ns);
+    if (readback->flushes == 1 || copy_ns - start_ns > 50000000 ||
+        (readback->flushes % 4096) == 0) {
+        error_report("vulkan-readback: capture #%" PRIu64
+                     " publish #%" PRIu64 " %ux%u submit=%.3f ms "
+                     "wait=%.3f ms cpu=%.3f ms total=%.3f ms",
+                     readback->flushes, readback->publishes,
+                     captured.width, captured.height,
                      (submit_ns - start_ns) / 1e6,
                      (wait_ns - submit_ns) / 1e6,
                      (copy_ns - wait_ns) / 1e6,
@@ -716,4 +850,66 @@ bool helios_vulkan_readback_flush(HeliosVulkanReadback *readback,
     return true;
 
 #undef VK_FLUSH
+}
+
+bool helios_vulkan_readback_publish(HeliosVulkanReadback *readback,
+                                    DisplaySurface *surface,
+                                    const HeliosVulkanReadbackRect *rect)
+{
+    VkResult result;
+    HeliosVulkanReadbackRect clipped;
+    int64_t start_ns, submit_ns, wait_ns, copy_ns;
+
+#define VK_PUBLISH(call) do {                                               \
+    result = (call);                                                        \
+    if (result != VK_SUCCESS) {                                             \
+        error_report("vulkan-readback: %s failed: %d", #call, result);     \
+        readback->failed = true;                                            \
+        return false;                                                       \
+    }                                                                       \
+} while (0)
+
+    if (!readback || readback->failed ||
+        !helios_vulkan_readback_clip_rect(readback, surface,
+                                          rect, &clipped)) {
+        return false;
+    }
+
+    start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    VK_PUBLISH(vkResetFences(readback->device, 1, &readback->fence));
+    VK_PUBLISH(vkResetCommandPool(readback->device,
+                                  readback->command_pool, 0));
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    VK_PUBLISH(vkBeginCommandBuffer(readback->command_buffer, &begin_info));
+
+    helios_vulkan_readback_record_publish(readback);
+    VK_PUBLISH(vkEndCommandBuffer(readback->command_buffer));
+
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &readback->command_buffer,
+    };
+    VK_PUBLISH(vkQueueSubmit(readback->queue, 1, &submit_info,
+                             readback->fence));
+    submit_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    VK_PUBLISH(vkWaitForFences(readback->device, 1, &readback->fence,
+                               VK_TRUE, UINT64_MAX));
+    wait_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    helios_vulkan_readback_copy_to_surface(readback, surface,
+                                           clipped.x, clipped.y,
+                                           clipped.width, clipped.height);
+    copy_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    readback->publishes++;
+    trace_helios_vulkan_publish(
+        readback->dmabuf_ino, readback->publishes,
+        clipped.width, clipped.height,
+        submit_ns - start_ns, wait_ns - submit_ns, copy_ns - wait_ns);
+    return true;
+
+#undef VK_PUBLISH
 }
