@@ -3005,12 +3005,13 @@ void vnc_sent_lossy_rect(VncWorker *worker, int x, int y, int w, int h)
     }
 }
 
-static int vnc_refresh_lossy_rect(VncDisplay *vd, int x, int y,
-                                  int height)
+static int vnc_refresh_lossy_rect(VncDisplay *vd, int x, int y)
 {
     VncState *vs;
     int sty = y / VNC_STAT_RECT;
     int stx = x / VNC_STAT_RECT;
+    int height = MIN(pixman_image_get_height(vd->guest.fb),
+                     pixman_image_get_height(vd->server));
     int has_dirty = 0;
     int rows;
 
@@ -3087,7 +3088,7 @@ static int vnc_update_stats(VncDisplay *vd,  struct timeval * tv)
 
             if (timercmp(&res, &VNC_REFRESH_LOSSY, >)) {
                 rect->freq = 0;
-                has_dirty += vnc_refresh_lossy_rect(vd, x, y, height);
+                has_dirty += vnc_refresh_lossy_rect(vd, x, y);
                 memset(rect->times, 0, sizeof (rect->times));
                 continue ;
             }
