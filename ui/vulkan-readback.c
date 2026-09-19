@@ -11,6 +11,8 @@
 struct HeliosVulkanReadback {
     QemuDmaBuf *dmabuf;
     VkInstance instance;
+    VkDebugUtilsMessengerEXT debug_messenger;
+    PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug_messenger;
     VkPhysicalDevice physical_device;
     VkDevice device;
     VkQueue queue;
@@ -43,7 +45,25 @@ struct HeliosVulkanReadback {
     bool failed;
     uint64_t flushes;
     uint64_t publishes;
+    uint64_t operations;
 };
+
+/* QEMU's native readback instance is separate from the Venus renderer. */
+static VKAPI_ATTR VkBool32 VKAPI_CALL helios_vulkan_readback_debug(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT type,
+    const VkDebugUtilsMessengerCallbackDataEXT *data, void *user_data)
+{
+    const HeliosVulkanReadback *readback = user_data;
+
+    error_report("vulkan-readback: validation rb=%p ino=%" PRIu64
+                 " severity=0x%x type=0x%x id=%s: %s", readback,
+                 (uint64_t)readback->dmabuf_ino, severity, type,
+                 data->pMessageIdName ? data->pMessageIdName : "unknown",
+                 data->pMessage ? data->pMessage : "(no message)");
+    /* Diagnostics must not turn a reported error into a skipped API call. */
+    return VK_FALSE;
+}
 
 #define HELIOS_VK_READBACK_CACHE_SIZE 8
 
@@ -89,6 +109,10 @@ HeliosVulkanReadback *helios_vulkan_readback_cache_activate(
                                            direct_optimal)) {
             cache->active = readback;
             cache->active_dmabuf = dmabuf;
+            trace_helios_vulkan_readback_bind(
+                readback, qemu_dmabuf_get_source_id(dmabuf),
+                readback->dmabuf_dev, readback->dmabuf_ino,
+                readback->dmabuf_size, readback->flushes, true);
             return readback;
         }
     }
@@ -103,6 +127,10 @@ HeliosVulkanReadback *helios_vulkan_readback_cache_activate(
     cache->entries[slot] = readback;
     cache->active = readback;
     cache->active_dmabuf = dmabuf;
+    trace_helios_vulkan_readback_bind(
+        readback, qemu_dmabuf_get_source_id(dmabuf),
+        readback->dmabuf_dev, readback->dmabuf_ino,
+        readback->dmabuf_size, readback->flushes, false);
     return readback;
 }
 
@@ -186,8 +214,14 @@ void helios_vulkan_readback_free(HeliosVulkanReadback *readback)
         return;
     }
 
+    trace_helios_vulkan_readback_free(readback, readback->dmabuf_ino,
+                                    readback->operations, readback->failed);
     if (readback->device) {
-        vkDeviceWaitIdle(readback->device);
+        VkResult result = vkDeviceWaitIdle(readback->device);
+
+        trace_helios_vulkan_readback_call(readback, readback->operations,
+                                        "vkDeviceWaitIdle (existing teardown)",
+                                        result);
     }
     if (readback->staging_map) {
         vkUnmapMemory(readback->device, readback->staging_memory);
@@ -219,6 +253,10 @@ void helios_vulkan_readback_free(HeliosVulkanReadback *readback)
     if (readback->device) {
         vkDestroyDevice(readback->device, NULL);
     }
+    if (readback->debug_messenger) {
+        readback->destroy_debug_messenger(readback->instance,
+                                         readback->debug_messenger, NULL);
+    }
     if (readback->instance) {
         vkDestroyInstance(readback->instance, NULL);
     }
@@ -243,6 +281,7 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
 
 #define VK_NEW(call) do {                                                   \
     result = (call);                                                        \
+    trace_helios_vulkan_readback_call(readback, 0, #call, result);             \
     if (result != VK_SUCCESS) {                                             \
         error_report("vulkan-readback: %s failed: %d", #call, result);     \
         goto fail;                                                          \
@@ -320,7 +359,59 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &application_info,
     };
+    const char *validation_layer = "VK_LAYER_KHRONOS_validation";
+    const char *instance_extensions[] = {
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
+        VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME,
+    };
+    VkDebugUtilsMessengerCreateInfoEXT debug_info = {
+        .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+        .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                       VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+        .pfnUserCallback = helios_vulkan_readback_debug,
+        .pUserData = readback,
+    };
+    VkValidationFeatureEnableEXT validation_enable =
+        VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+    VkValidationFeaturesEXT validation_info = {
+        .sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
+        .pNext = &debug_info,
+        .enabledValidationFeatureCount = 1,
+        .pEnabledValidationFeatures = &validation_enable,
+    };
+    bool validate =
+        g_strcmp0(g_getenv("HELIOS_VK_READBACK_VALIDATE"), "1") == 0;
+
+    if (validate) {
+        instance_info.pNext = &validation_info;
+        instance_info.enabledLayerCount = 1;
+        instance_info.ppEnabledLayerNames = &validation_layer;
+        instance_info.enabledExtensionCount = ARRAY_SIZE(instance_extensions);
+        instance_info.ppEnabledExtensionNames = instance_extensions;
+    }
     VK_NEW(vkCreateInstance(&instance_info, NULL, &readback->instance));
+    if (validate) {
+        PFN_vkCreateDebugUtilsMessengerEXT create_debug_messenger =
+            (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+                readback->instance, "vkCreateDebugUtilsMessengerEXT");
+
+        readback->destroy_debug_messenger =
+            (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(
+                readback->instance, "vkDestroyDebugUtilsMessengerEXT");
+        if (!create_debug_messenger || !readback->destroy_debug_messenger) {
+            error_report("vulkan-readback: requested validation unavailable: "
+                         "debug messenger entry points missing");
+            goto fail;
+        }
+        VK_NEW(create_debug_messenger(readback->instance, &debug_info, NULL,
+                                      &readback->debug_messenger));
+        error_report("vulkan-readback: validation enabled rb=%p ino=%" PRIu64
+                     " core=1 sync=1", readback,
+                     (uint64_t)readback->dmabuf_ino);
+    }
 
     VK_NEW(vkEnumeratePhysicalDevices(readback->instance,
                                       &physical_device_count, NULL));
@@ -446,14 +537,25 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
         VkMemoryRequirements image_requirements;
 
         image_info.usage = image_usages[i];
+        trace_helios_vulkan_readback_image(
+            readback, image_info.format, image_info.flags, image_info.usage,
+            image_info.tiling, image_info.extent.width,
+            image_info.extent.height, external_image.handleTypes,
+            readback->producer_layout, readback->queue_family);
         result = vkCreateImage(readback->device, &image_info, NULL,
                                &readback->image);
+        trace_helios_vulkan_readback_call(readback, 0, "vkCreateImage", result);
         if (result != VK_SUCCESS) {
             readback->image = VK_NULL_HANDLE;
             continue;
         }
         vkGetImageMemoryRequirements(readback->device, readback->image,
                                      &image_requirements);
+        trace_helios_vulkan_readback_requirements(
+            readback, readback->dmabuf_dev, readback->dmabuf_ino,
+            readback->dmabuf_size, image_requirements.size,
+            image_requirements.alignment, image_requirements.memoryTypeBits,
+            fd_properties.memoryTypeBits);
         if (direct_optimal && image_requirements.size != dmabuf_size) {
             error_report("vulkan-readback: OPTIMAL DMA-BUF shape mismatch "
                          "required=%" PRIu64 " fd_size=%" PRIu64,
@@ -496,6 +598,8 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
         };
         result = vkAllocateMemory(readback->device, &image_memory_info, NULL,
                                   &readback->image_memory);
+        trace_helios_vulkan_readback_call(readback, 0,
+                                        "vkAllocateMemory (import)", result);
         if (result != VK_SUCCESS) {
             close(import_fd);
             import_fd = -1;
@@ -506,6 +610,10 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
         import_fd = -1;
         VK_NEW(vkBindImageMemory(readback->device, readback->image,
                                  readback->image_memory, 0));
+        trace_helios_vulkan_readback_memory(
+            readback, "image", (uint64_t)readback->image,
+            (uint64_t)readback->image_memory, image_memory_info.allocationSize,
+            image_memory_type);
         error_report("vulkan-readback: DMA-BUF import tiling=%s "
                      "usage=0x%x flags=0x%x size=%" PRIu64
                      " modifier=0x%" PRIx64,
@@ -549,6 +657,10 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
                             &readback->snapshot_memory));
     VK_NEW(vkBindBufferMemory(readback->device, readback->snapshot,
                               readback->snapshot_memory, 0));
+    trace_helios_vulkan_readback_memory(
+        readback, "snapshot", (uint64_t)readback->snapshot,
+        (uint64_t)readback->snapshot_memory,
+        snapshot_memory_info.allocationSize, snapshot_memory_type);
 
     buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VK_NEW(vkCreateBuffer(readback->device, &buffer_info, NULL,
@@ -574,6 +686,10 @@ HeliosVulkanReadback *helios_vulkan_readback_new(QemuDmaBuf *dmabuf,
                             &readback->staging_memory));
     VK_NEW(vkBindBufferMemory(readback->device, readback->staging,
                               readback->staging_memory, 0));
+    trace_helios_vulkan_readback_memory(
+        readback, "staging", (uint64_t)readback->staging,
+        (uint64_t)readback->staging_memory, staging_memory_info.allocationSize,
+        staging_memory_type);
     VK_NEW(vkMapMemory(readback->device, readback->staging_memory, 0,
                        staging_size, 0, (void **)&readback->staging_map));
 
@@ -720,6 +836,8 @@ bool helios_vulkan_readback_capture(HeliosVulkanReadback *readback,
 
 #define VK_FLUSH(call) do {                                                 \
     result = (call);                                                        \
+    trace_helios_vulkan_readback_call(readback, readback->operations,          \
+                                    #call, result);                          \
     if (result != VK_SUCCESS) {                                             \
         error_report("vulkan-readback: %s failed: %d", #call, result);     \
         readback->failed = true;                                            \
@@ -740,6 +858,10 @@ bool helios_vulkan_readback_capture(HeliosVulkanReadback *readback,
     src_y = readback->origin_y + captured.y;
 
     start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    readback->operations++;
+    trace_helios_vulkan_readback_begin(
+        readback, readback->operations, "capture", captured.x, captured.y,
+        captured.width, captured.height, publish != NULL);
     VK_FLUSH(vkResetFences(readback->device, 1, &readback->fence));
     VK_FLUSH(vkResetCommandPool(readback->device, readback->command_pool, 0));
     VkCommandBufferBeginInfo begin_info = {
@@ -862,6 +984,8 @@ bool helios_vulkan_readback_publish(HeliosVulkanReadback *readback,
 
 #define VK_PUBLISH(call) do {                                               \
     result = (call);                                                        \
+    trace_helios_vulkan_readback_call(readback, readback->operations,          \
+                                    #call, result);                          \
     if (result != VK_SUCCESS) {                                             \
         error_report("vulkan-readback: %s failed: %d", #call, result);     \
         readback->failed = true;                                            \
@@ -876,6 +1000,10 @@ bool helios_vulkan_readback_publish(HeliosVulkanReadback *readback,
     }
 
     start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    readback->operations++;
+    trace_helios_vulkan_readback_begin(
+        readback, readback->operations, "publish", clipped.x, clipped.y,
+        clipped.width, clipped.height, true);
     VK_PUBLISH(vkResetFences(readback->device, 1, &readback->fence));
     VK_PUBLISH(vkResetCommandPool(readback->device,
                                   readback->command_pool, 0));
