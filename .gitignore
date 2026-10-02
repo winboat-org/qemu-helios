@@ -21,3 +21,10 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+# Local standalone devenv state
+/.devenv/
+/.direnv/
+
+/result
+/result-*
