@@ -753,14 +753,16 @@ void egl_cleanup(void)
         qemu_egl_rn_ctx = NULL;
     }
 
-#ifdef CONFIG_GBM
-    g_clear_pointer(&qemu_egl_rn_gbm_dev, gbm_device_destroy);
-    g_clear_fd(&qemu_egl_rn_fd, NULL);
-#endif
-
     if (qemu_egl_display) {
+        /* A destroyed context can remain current until the thread releases it.
+         * Keep the GBM device alive while EGL frees its driver resources. */
         eglReleaseThread();
         eglTerminate(qemu_egl_display);
         qemu_egl_display = NULL;
     }
+
+#ifdef CONFIG_GBM
+    g_clear_pointer(&qemu_egl_rn_gbm_dev, gbm_device_destroy);
+    g_clear_fd(&qemu_egl_rn_fd, NULL);
+#endif
 }
