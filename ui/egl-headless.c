@@ -53,6 +53,53 @@ typedef struct egl_dpy {
 
 static GPtrArray *egl_dpys;
 
+typedef struct EGLHeadlessContext {
+    EGLDisplay display;
+    EGLContext context;
+    EGLSurface draw;
+    EGLSurface read;
+    bool saved;
+} EGLHeadlessContext;
+
+static void egl_headless_context_restore(EGLHeadlessContext *scope)
+{
+    if (scope->saved &&
+        (eglGetCurrentDisplay() != scope->display ||
+         eglGetCurrentContext() != scope->context ||
+         eglGetCurrentSurface(EGL_DRAW) != scope->draw ||
+         eglGetCurrentSurface(EGL_READ) != scope->read) &&
+        !eglMakeCurrent(scope->display ? scope->display : qemu_egl_display,
+                        scope->draw, scope->read, scope->context)) {
+        error_report("egl-headless: restoring EGL context failed: %s",
+                     qemu_egl_get_error_string());
+    }
+}
+
+G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(EGLHeadlessContext,
+                               egl_headless_context_restore)
+
+static bool egl_headless_context_bind(EGLHeadlessContext *scope)
+{
+    scope->display = eglGetCurrentDisplay();
+    scope->context = eglGetCurrentContext();
+    scope->draw = eglGetCurrentSurface(EGL_DRAW);
+    scope->read = eglGetCurrentSurface(EGL_READ);
+    if (scope->display == qemu_egl_display &&
+        scope->context == qemu_egl_rn_ctx) {
+        scope->saved = true;
+        return true;
+    }
+    /* Venus blob commands do not leave a GL context current.  Epoxy resolves
+     * EGL image extensions against the current display, and our framebuffer
+     * objects belong to the display context rather than a renderer context.
+     * Restore the renderer's state (including no context) at callback exit. */
+    if (qemu_egl_make_context_current(NULL, qemu_egl_rn_ctx) < 0) {
+        return false;
+    }
+    scope->saved = true;
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 
 static void egl_refresh(DisplayChangeListener *dcl)
@@ -538,6 +585,11 @@ static QEMUGLContext egl_create_context(DisplayGLCtx *dgc,
 static void egl_scanout_disable(DisplayChangeListener *dcl)
 {
     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
+    g_auto(EGLHeadlessContext) scope = { 0 };
+
+    if (!egl_headless_context_bind(&scope)) {
+        return;
+    }
 
 #if defined(CONFIG_GBM) && defined(CONFIG_LINUX)
     egl_vulkan_readback_cache_clear(edpy);
@@ -557,6 +609,11 @@ static void egl_scanout_texture(DisplayChangeListener *dcl,
                                 void *d3d_tex2d)
 {
     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
+    g_auto(EGLHeadlessContext) scope = { 0 };
+
+    if (!egl_headless_context_bind(&scope)) {
+        return;
+    }
 
     edpy->y_0_top = backing_y_0_top;
 
@@ -578,6 +635,11 @@ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
                                QemuDmaBuf *dmabuf)
 {
     uint32_t width, height, texture;
+    g_auto(EGLHeadlessContext) scope = { 0 };
+
+    if (!egl_headless_context_bind(&scope)) {
+        return;
+    }
 #ifdef CONFIG_LINUX
     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
     bool same_readback =
@@ -604,6 +666,13 @@ static void egl_scanout_dmabuf(DisplayChangeListener *dcl,
         }
     }
 #endif
+
+    /* The Vulkan ICD may release this thread's EGL context while initializing.
+     * Bind again after the native readback attempt, before epoxy resolves image
+     * extensions against the current display or any GL framebuffer work. */
+    if (qemu_egl_make_context_current(NULL, qemu_egl_rn_ctx) < 0) {
+        return;
+    }
 
     /* Explicit modifiers and the proven LINEAR export remain EGL-importable. */
     while (glGetError() != GL_NO_ERROR) {
@@ -677,6 +746,11 @@ static void egl_cursor_dmabuf(DisplayChangeListener *dcl,
 {
     uint32_t width, height, texture;
     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
+    g_auto(EGLHeadlessContext) scope = { 0 };
+
+    if (!egl_headless_context_bind(&scope)) {
+        return;
+    }
 
     if (dmabuf) {
         egl_dmabuf_import_texture(dmabuf);
@@ -696,6 +770,11 @@ static void egl_cursor_dmabuf(DisplayChangeListener *dcl,
 static void egl_release_dmabuf(DisplayChangeListener *dcl,
                                QemuDmaBuf *dmabuf)
 {
+    g_auto(EGLHeadlessContext) scope = { 0 };
+
+    if (!egl_headless_context_bind(&scope)) {
+        return;
+    }
 #ifdef CONFIG_LINUX
     egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
 
@@ -796,6 +875,12 @@ static void egl_scanout_flush(DisplayChangeListener *dcl,
 #endif
 
     if (!edpy->guest_fb.texture) {
+        return;
+    }
+
+    g_auto(EGLHeadlessContext) scope = { 0 };
+
+    if (!egl_headless_context_bind(&scope)) {
         return;
     }
 
@@ -902,19 +987,24 @@ static void egl_headless_init(DisplayState *ds, DisplayOptions *opts)
 
 static void egl_headless_cleanup(void)
 {
+    bool have_context;
+
     if (!egl_dpys) {
         return;
     }
 
+    have_context = qemu_egl_make_context_current(NULL, qemu_egl_rn_ctx) == 0;
     for (guint i = 0; i < egl_dpys->len; i++) {
         egl_dpy *edpy = g_ptr_array_index(egl_dpys, i);
 
         qemu_console_unregister_listener(&edpy->dcl);
         qemu_console_set_display_gl_ctx(edpy->dcl.con, NULL);
-        egl_fb_destroy(&edpy->guest_fb);
-        egl_fb_destroy(&edpy->cursor_fb);
-        egl_fb_destroy(&edpy->blit_fb);
-        qemu_gl_fini_shader(edpy->gls);
+        if (have_context) {
+            egl_fb_destroy(&edpy->guest_fb);
+            egl_fb_destroy(&edpy->cursor_fb);
+            egl_fb_destroy(&edpy->blit_fb);
+            qemu_gl_fini_shader(edpy->gls);
+        }
         g_free(edpy->ctx);
         g_free(edpy);
     }
