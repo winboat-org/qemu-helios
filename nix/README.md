@@ -27,3 +27,9 @@ recorded build environment does not make the compiler, build tools or source
 archives runtime dependencies. Nix rejects those dependencies in the runtime
 output. Debug symbols and their source references remain in the separate debug
 output and accompany exported artifacts.
+
+Only x86 EDK2 images accompany the x86_64-softmmu build; images for ARM, RISC-V
+and LoongArch are excluded. Component CI publishes QEMU's own executable,
+modules, data, symbols and validation reports. Runtime dependency paths and
+hashes are recorded in build provenance; this component artifact is not a
+self-contained host environment.

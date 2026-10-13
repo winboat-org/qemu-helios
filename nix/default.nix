@@ -89,6 +89,9 @@ base.overrideAttrs (old: {
     cp pc-bios/README $out/share/licenses/qemu-helios/firmware-README
     find pc-bios -maxdepth 1 -iname '*license*' -exec cp '{}' $out/share/licenses/qemu-helios/ ';'
     cp -r pc-bios/descriptors $out/share/qemu/firmware-descriptors
+    # This build has only x86_64-softmmu. Other architectures' EDK2 images
+    # account for hundreds of MiB and cannot be used by this executable.
+    rm -f "$out"/share/qemu/edk2-{aarch64,arm,riscv,loongarch64}-*.fd
     mkdir -p $out/share/build-validation/qemu-helios
     # Meson logs repeat the entire build environment, including source/compiler
     # store paths. Preserve every byte without turning those paths into runtime
