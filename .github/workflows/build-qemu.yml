@@ -39,7 +39,7 @@ jobs:
           [[ "$ROOT_REVISION" =~ ^[0-9a-f]{40}$ ]]
           [[ "$COMPONENT_REVISION" =~ ^[0-9a-f]{40}$ ]]
           test "$COMPONENT_REVISION" = "$GITHUB_SHA"
-      - name: Checkout the exact root operation and installer source
+      - name: Checkout the exact build operations and source pins
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, verified 2026-10-06
         with:
           repository: winboat-org/winboat-devenv

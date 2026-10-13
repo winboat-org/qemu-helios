@@ -32,6 +32,7 @@ let
   };
 in
 base.overrideAttrs (old: {
+  __structuredAttrs = true;
   pname = "qemu-helios";
   version = "11.1.1";
   src = sources.qemu-helios;
@@ -89,11 +90,20 @@ base.overrideAttrs (old: {
     find pc-bios -maxdepth 1 -iname '*license*' -exec cp '{}' $out/share/licenses/qemu-helios/ ';'
     cp -r pc-bios/descriptors $out/share/qemu/firmware-descriptors
     mkdir -p $out/share/build-validation/qemu-helios
-    cp build/meson-logs/testlog.json build/meson-logs/testlog.txt $out/share/build-validation/qemu-helios/
-    # Test commands include the debug-prefix map. Keep the reports without an
-    # out -> debug reference cycle; the artifact manifest identifies debug.
-    substituteInPlace $out/share/build-validation/qemu-helios/testlog.{json,txt} \
-      --replace-warn "$debug" '@debug-output@'
+    # Meson logs repeat the entire build environment, including source/compiler
+    # store paths. Preserve every byte without turning those paths into runtime
+    # dependencies or creating an out -> debug reference cycle.
+    for report in testlog.json testlog.txt; do
+      gzip -n -9 -c "build/meson-logs/$report" > "$out/share/build-validation/qemu-helios/$report.gz"
+    done
   '';
+  outputChecks.out.disallowedRequisites = [
+    pkgs.stdenv.cc.cc
+    sources.qemu-helios
+    pkgs.qemu.src
+    pkgs.vulkan-headers
+    pkgs.meson
+    pkgs.ninja
+  ];
   requiredSystemFeatures = [ ];
 })

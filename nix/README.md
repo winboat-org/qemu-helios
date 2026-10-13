@@ -19,3 +19,11 @@ Guest dispatch records require Stage 4's local disk mirror and durable elevated
 backend. They are plans, with runtime verification pending; MinGW outputs cannot
 substitute for an MSVC static engine. Licenses and debug symbols must accompany
 exported artifacts.
+
+The runtime output retains the complete Meson unit reports as
+`share/build-validation/qemu-helios/testlog.json.gz` and `testlog.txt.gz`.
+They are losslessly compressed with timestamp-free gzip headers so their
+recorded build environment does not make the compiler, build tools or source
+archives runtime dependencies. Nix rejects those dependencies in the runtime
+output. Debug symbols and their source references remain in the separate debug
+output and accompany exported artifacts.
